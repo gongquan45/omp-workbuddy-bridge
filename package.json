@@ -1,0 +1,23 @@
+{
+	"name": "omp-workbuddy-bridge",
+	"version": "1.0.0",
+	"description": "OMP-native extension delegating research/office/design tasks to WorkBuddy desktop agent sessions",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"test": "bun test",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@agentclientprotocol/sdk": "1.8.0",
+		"zod": "4.6.7"
+	},
+	"devDependencies": {
+		"@oh-my-pi/pi-coding-agent": "18.10.3",
+		"@types/bun": "1.4.2",
+		"typescript": "5.9.3"
+	},
+	"omp": {
+		"extensions": ["./src/index.ts"]
+	}
+}
