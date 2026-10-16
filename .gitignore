@@ -5,3 +5,7 @@ node_modules/
 .env
 .env.*
 !.env.example
+
+# Local research and validation reports
+*报告.md
+*-report.md
