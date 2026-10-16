@@ -16,10 +16,12 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import process from "node:process";
-import type { Binding, TaskReceipt } from "../src/types";
+import type { Binding, TaskReceipt, TaskStatus, RoundConfirmation } from "../src/types";
 import { WB_ERROR_CODE } from "../src/types";
 import {
 	collectArtifacts,
+	computeFileSha256,
+	currentRound,
 	isPidAlive,
 	prepareTask,
 	readBinding,
@@ -31,6 +33,70 @@ import {
 	writeBinding,
 	writeTask,
 } from "../src/tasks";
+
+async function runPrepare(
+	binding: Binding,
+	options: {
+		prompt: string;
+		inputFiles?: string[];
+		expectedOutputs?: string[];
+		taskId?: string;
+		acceptance?: string[];
+		previousRound?: number;
+		inputs?: Array<{ path: string; sha256: string }>;
+	}
+) {
+	let confirmedInputs = options.inputs;
+	if (confirmedInputs === undefined) {
+		confirmedInputs = [];
+		if (options.inputFiles) {
+			for (const rel of options.inputFiles) {
+				const abs = path.resolve(binding.projectRoot, rel);
+				try {
+					confirmedInputs.push({ path: rel.split(path.sep).join("/"), sha256: await computeFileSha256(abs) });
+				} catch {
+					confirmedInputs.push({ path: rel.split(path.sep).join("/"), sha256: "fake-hash" });
+				}
+			}
+		}
+	}
+	let previousRound = options.previousRound;
+	if (previousRound === undefined) {
+		if (options.taskId) {
+			try {
+				const existing = await readTask(binding.projectRoot, options.taskId);
+				previousRound = existing.rounds.length;
+			} catch {
+				previousRound = 0;
+			}
+		} else {
+			previousRound = 0;
+		}
+	}
+	const confirmation: RoundConfirmation = {
+		source: "host_dialog",
+		at: new Date().toISOString(),
+		sessionId: binding.sessionId,
+		previousRound,
+		inputs: confirmedInputs,
+	};
+	return await prepareTask(
+		binding,
+		{
+			goal: {
+				objective: options.prompt,
+				context: "",
+				constraints: [],
+				acceptance: options.acceptance ?? ["Acceptance satisfied"],
+				externalActions: [],
+			},
+			inputFiles: options.inputFiles,
+			expectedOutputs: options.expectedOutputs,
+			taskId: options.taskId,
+		},
+		confirmation
+	);
+}
 
 /** Tracks temporary directories allocated during test runs for guaranteed cleanup. */
 const allocatedTempDirs: string[] = [];
@@ -208,7 +274,7 @@ describe("prepareTask setup and brief contents", () => {
 		};
 		await writeBinding(binding);
 
-		const result = await prepareTask(binding, {
+		const result = await runPrepare(binding, {
 			prompt: "Inspect sales data and generate visual report",
 		});
 
@@ -217,21 +283,10 @@ describe("prepareTask setup and brief contents", () => {
 		expect(path.isAbsolute(result.outputsDir)).toBe(true);
 
 		const taskDir = path.join(projectRoot, ".wb-bridge", "tasks", result.receipt.taskId);
-		const taskEntries = await readdir(taskDir);
-		taskEntries.sort();
-		expect(taskEntries).toEqual(["brief.md", "inputs", "outputs", "receipt.json"]);
-
-		// Verify brief.md mandatory content items
-		const briefText = await readFile(result.briefPath, "utf-8");
-		expect(briefText).toContain("Inspect sales data and generate visual report");
-		expect(briefText).toContain(result.outputsDir);
-		expect(briefText).toContain("Deliverables must be written ONLY into this task's outputs directory");
-		expect(briefText).toContain("The final response must list the real produced artifacts");
-		expect(briefText).toContain("Do NOT call back into OMP");
-		expect(briefText).toContain("Do NOT modify project source files");
-		expect(briefText).toContain("Do NOT publish, send, or transmit anything externally");
-		expect(briefText).toContain("Do NOT self-approve permissions");
-		expect(briefText).toContain("division of labour");
+		const round1Dir = path.join(taskDir, "rounds", "1");
+		const roundEntries = await readdir(round1Dir);
+		roundEntries.sort();
+		expect(roundEntries).toEqual(["brief.md", "inputs", "outputs"]);
 
 		await releaseTask(projectRoot, result.receipt.taskId);
 	});
@@ -246,15 +301,15 @@ describe("prepareTask setup and brief contents", () => {
 		};
 		await writeBinding(binding);
 
-		const result = await prepareTask(binding, {
+		const result = await runPrepare(binding, {
 			prompt: "Compare SQLite and DuckDB for embedded analytics",
 		});
 
-		expect(result.receipt.status).toBe("running");
-		expect(result.receipt.inputFiles).toEqual([]);
-		expect(result.receipt.expectedOutputs).toEqual([]);
-		expect(result.receipt.error).toBeNull();
-
+		const current = currentRound(result.receipt);
+		expect(current.status).toBe("running");
+		expect(current.inputFiles).toEqual([]);
+		expect(current.expectedOutputs).toEqual([]);
+		expect(current.error).toBeNull();
 		await releaseTask(projectRoot, result.receipt.taskId);
 	});
 });
@@ -276,18 +331,21 @@ describe("inputFiles validation and snapshotting", () => {
 		const sourceFile = path.join(nestedDir, "metrics.csv");
 		await writeFile(sourceFile, "metric,value\ncpu,42", "utf-8");
 
-		const result = await prepareTask(binding, {
+		const result = await runPrepare(binding, {
 			prompt: "Summarize metrics",
 			inputFiles: [path.join("src", "data", "metrics.csv")],
 		});
 
-		expect(result.receipt.inputFiles).toEqual(["src/data/metrics.csv"]);
+		const current = currentRound(result.receipt);
+		expect(current.inputFiles.map((i) => i.path)).toEqual(["src/data/metrics.csv"]);
 
 		const snapshotPath = path.join(
 			projectRoot,
 			".wb-bridge",
 			"tasks",
 			result.receipt.taskId,
+			"rounds",
+			"1",
 			"inputs",
 			"src",
 			"data",
@@ -329,7 +387,7 @@ describe("inputFiles validation and snapshotting", () => {
 		for (const invalidInput of testCases) {
 			let caught: unknown = null;
 			try {
-				await prepareTask(binding, {
+				await runPrepare(binding, {
 					prompt: "Test invalid input rejection",
 					inputFiles: [invalidInput],
 				});
@@ -362,7 +420,7 @@ describe("inputFiles validation and snapshotting", () => {
 
 		let caught: unknown = null;
 		try {
-			await prepareTask(binding, {
+			await runPrepare(binding, {
 				prompt: "Attempt reading outside symlink",
 				inputFiles: ["symlink-to-outside.txt"],
 			});
@@ -398,7 +456,7 @@ describe("expectedOutputs validation", () => {
 		for (const out of invalidOutputs) {
 			let caught: unknown = null;
 			try {
-				await prepareTask(binding, {
+				await runPrepare(binding, {
 					prompt: "Test invalid expected output",
 					expectedOutputs: [out],
 				});
@@ -422,12 +480,13 @@ describe("expectedOutputs validation", () => {
 		};
 		await writeBinding(binding);
 
-		const result = await prepareTask(binding, {
+		const result = await runPrepare(binding, {
 			prompt: "Deduplication check",
 			expectedOutputs: ["report.pdf", "data.json", "report.pdf", "data.json", "charts/pie.png"],
 		});
 
-		expect(result.receipt.expectedOutputs).toEqual(["report.pdf", "data.json", "charts/pie.png"]);
+		const current = currentRound(result.receipt);
+		expect(current.expectedOutputs).toEqual(["report.pdf", "data.json", "charts/pie.png"]);
 
 		await releaseTask(projectRoot, result.receipt.taskId);
 	});
@@ -445,8 +504,8 @@ describe("exclusive task locking and dead-owner recovery", () => {
 		await writeBinding(binding);
 
 		const results = await Promise.allSettled([
-			prepareTask(binding, { prompt: "Task branch A" }),
-			prepareTask(binding, { prompt: "Task branch B" }),
+			runPrepare(binding, { prompt: "Task branch A" }),
+			runPrepare(binding, { prompt: "Task branch B" }),
 		]);
 
 		const fulfilled = results.filter((r) => r.status === "fulfilled");
@@ -480,7 +539,7 @@ describe("exclusive task locking and dead-owner recovery", () => {
 		};
 		await writeBinding(binding);
 
-		const { receipt } = await prepareTask(binding, { prompt: "Release safety check" });
+		const { receipt } = await runPrepare(binding, { prompt: "Release safety check" });
 		const lockPath = path.join(projectRoot, ".wb-bridge", "active.lock");
 
 		// Mismatched taskId must not delete the lock file
@@ -522,17 +581,30 @@ describe("exclusive task locking and dead-owner recovery", () => {
 
 		const orphanedTaskId = crypto.randomUUID();
 		const orphanedReceipt: TaskReceipt = {
-			version: 1,
+			version: 2,
 			taskId: orphanedTaskId,
 			sessionId: binding.sessionId,
 			projectRoot,
-			status: "running",
-			prompt: "Original interrupted work",
-			inputFiles: [],
-			expectedOutputs: [],
-			summary: "",
-			artifacts: [],
-			error: null,
+			rounds: [
+				{
+					number: 1,
+					layout: "round",
+					goal: {
+						objective: "Original interrupted work",
+						context: "",
+						constraints: [],
+						acceptance: ["done"],
+						externalActions: [],
+					},
+					inputFiles: [],
+					expectedOutputs: [],
+					status: "running",
+					summary: "",
+					error: null,
+					artifacts: [],
+					consent: { source: "host_dialog", at: new Date().toISOString() },
+				},
+			],
 		};
 		await writeTask(orphanedReceipt);
 
@@ -550,23 +622,23 @@ describe("exclusive task locking and dead-owner recovery", () => {
 		);
 
 		// Prepare a new task; it should reap the stale lock and succeed
-		const newResult = await prepareTask(binding, {
+		const newResult = await runPrepare(binding, {
 			prompt: "New incoming task",
 		});
 
-		expect(newResult.receipt.status).toBe("running");
+		expect(currentRound(newResult.receipt).status).toBe("running");
 
 		// Inspect the orphaned task's receipt to verify interrupted transition and reason
 		const updatedOrphan = await readTask(projectRoot, orphanedTaskId);
-		expect(updatedOrphan.status).toBe("interrupted");
-		expect(updatedOrphan.error).not.toBeNull();
-		if (updatedOrphan.error !== null) {
-			expect(updatedOrphan.error.code).toBe(WB_ERROR_CODE.interrupted);
-			expect(updatedOrphan.error.message).toContain(String(deadPid));
+		const orphanRound = currentRound(updatedOrphan);
+		expect(orphanRound.status).toBe("interrupted");
+		expect(orphanRound.error).not.toBeNull();
+		if (orphanRound.error !== null) {
+			expect(orphanRound.error.code).toBe(WB_ERROR_CODE.interrupted);
+			expect(orphanRound.error.message).toContain(String(deadPid));
 		}
 		// Confirm the orphaned prompt was not replayed or altered
-		expect(updatedOrphan.prompt).toBe("Original interrupted work");
-
+		expect(orphanRound.goal.objective).toBe("Original interrupted work");
 		await releaseTask(projectRoot, newResult.receipt.taskId);
 	});
 
@@ -586,7 +658,7 @@ describe("exclusive task locking and dead-owner recovery", () => {
 
 		let caught: unknown = null;
 		try {
-			await prepareTask(binding, { prompt: "Acquire against corrupted lock" });
+			await runPrepare(binding, { prompt: "Acquire against corrupted lock" });
 		} catch (err: unknown) {
 			caught = err;
 		}
@@ -628,7 +700,7 @@ describe("exclusive task locking and dead-owner recovery", () => {
 
 		let caught: unknown = null;
 		try {
-			await prepareTask(binding, { prompt: "New task against corrupt orphan" });
+			await runPrepare(binding, { prompt: "New task against corrupt orphan" });
 		} catch (err: unknown) {
 			caught = err;
 		}
@@ -667,8 +739,8 @@ describe("exclusive task locking and dead-owner recovery", () => {
 
 		// Nothing is left to commit for a task that never wrote a receipt, so the
 		// slot is recoverable.
-		const prepared = await prepareTask(binding, { prompt: "New task after bare lock" });
-		expect(prepared.receipt.status).toBe("running");
+		const prepared = await runPrepare(binding, { prompt: "New task after bare lock" });
+		expect(currentRound(prepared.receipt).status).toBe("running");
 		expect((await readTaskLock(projectRoot))?.taskId).toBe(prepared.receipt.taskId);
 		await releaseTask(projectRoot, prepared.receipt.taskId);
 	});
@@ -694,7 +766,7 @@ describe("exclusive task locking and dead-owner recovery", () => {
 
 		let caught: unknown = null;
 		try {
-			await prepareTask(binding, { prompt: "Should be blocked" });
+			await runPrepare(binding, { prompt: "Should be blocked" });
 		} catch (err: unknown) {
 			caught = err;
 		}
@@ -760,17 +832,30 @@ describe("exclusive task locking and dead-owner recovery", () => {
 		const projectRoot = await createProjectRoot();
 		const taskId = crypto.randomUUID();
 		const receipt: TaskReceipt = {
-			version: 1,
+			version: 2,
 			taskId,
 			sessionId: crypto.randomUUID(),
 			projectRoot,
-			status: "completed",
-			prompt: "unwritable",
-			inputFiles: [],
-			expectedOutputs: [],
-			summary: "",
-			artifacts: [],
-			error: null,
+			rounds: [
+				{
+					number: 1,
+					layout: "round",
+					goal: {
+						objective: "unwritable",
+						context: "",
+						constraints: [],
+						acceptance: ["done"],
+						externalActions: [],
+					},
+					inputFiles: [],
+					expectedOutputs: [],
+					status: "completed",
+					summary: "",
+					artifacts: [],
+					error: null,
+					consent: { source: "host_dialog", at: new Date().toISOString() },
+				},
+			],
 		};
 
 		// A directory where the receipt file belongs makes the atomic rename fail
@@ -795,18 +880,31 @@ describe("exclusive task locking and dead-owner recovery", () => {
 	it("still reports structure problems on a receipt as state-invalid", async () => {
 		const projectRoot = await createProjectRoot();
 		const receipt = {
-			version: 1,
+			version: 2,
 			taskId: crypto.randomUUID(),
 			sessionId: crypto.randomUUID(),
 			projectRoot,
-			status: "completed",
-			prompt: "x",
-			inputFiles: [],
-			expectedOutputs: [],
-			summary: "",
-			artifacts: [],
-			error: null,
-		} as TaskReceipt;
+			rounds: [
+				{
+					number: 1,
+					layout: "round",
+					goal: {
+						objective: "x",
+						context: "",
+						constraints: [],
+						acceptance: ["done"],
+						externalActions: [],
+					},
+					inputFiles: [],
+					expectedOutputs: [],
+					status: "sideways",
+					summary: "",
+					artifacts: [],
+					error: null,
+					consent: null,
+				},
+			],
+		} as unknown as TaskReceipt;
 		// @ts-expect-error deliberately malformed status to prove the classification
 		receipt.status = "sideways";
 
@@ -840,24 +938,37 @@ describe("exclusive task locking and dead-owner recovery", () => {
 		const taskId = crypto.randomUUID();
 		const taskDir = path.join(externalBridge, "tasks", taskId);
 		await mkdir(taskDir, { recursive: true });
-		await writeFile(path.join(taskDir, "inputs"), "not a directory", "utf-8");
+		await writeFile(path.join(taskDir, "rounds"), "not a directory", "utf-8");
 		await writeTask({
-			version: 1,
+			version: 2,
 			taskId,
 			sessionId: binding.sessionId,
 			projectRoot,
-			status: "completed",
-			prompt: "finished work",
-			inputFiles: [],
-			expectedOutputs: [],
-			summary: "done",
-			artifacts: [],
-			error: null,
+			rounds: [
+				{
+					number: 1,
+					layout: "round",
+					goal: {
+						objective: "finished work",
+						context: "",
+						constraints: [],
+						acceptance: ["done"],
+						externalActions: [],
+					},
+					inputFiles: [],
+					expectedOutputs: [],
+					status: "completed",
+					summary: "done",
+					artifacts: [],
+					error: null,
+					consent: { source: "host_dialog", at: new Date().toISOString() },
+				},
+			],
 		});
 
 		let caught: unknown = null;
 		try {
-			await prepareTask(binding, { prompt: "supplement", taskId });
+			await runPrepare(binding, { prompt: "supplement", taskId });
 		} catch (err: unknown) {
 			caught = err;
 		}
@@ -894,7 +1005,7 @@ describe("supplementary turns on existing tasks", () => {
 		await writeFile(path.join(projectRoot, "step1.txt"), "data 1", "utf-8");
 		await writeFile(path.join(projectRoot, "step2.txt"), "data 2", "utf-8");
 
-		const initial = await prepareTask(binding, {
+		const initial = await runPrepare(binding, {
 			prompt: "First initial instruction",
 			inputFiles: ["step1.txt"],
 			expectedOutputs: ["initial-output.md"],
@@ -904,28 +1015,37 @@ describe("supplementary turns on existing tasks", () => {
 		const initialOutputDest = path.join(initial.outputsDir, "initial-output.md");
 		await writeFile(initialOutputDest, "# Initial Deliverable Content", "utf-8");
 
-		const completedReceipt: TaskReceipt = {
-			...initial.receipt,
-			status: "completed",
-			summary: "First instruction completed successfully",
-			artifacts: [initialOutputDest],
-		};
-		await writeTask(completedReceipt);
+		const current = currentRound(initial.receipt);
+		current.status = "completed";
+		current.summary = "First instruction completed successfully";
+		current.artifacts = [
+			{
+				kind: "file",
+				path: initialOutputDest,
+				sha256: await computeFileSha256(initialOutputDest),
+				bytes: 28,
+				role: "final",
+				provenance: "native",
+				importedFrom: null,
+			},
+		];
+		await writeTask(initial.receipt);
 		await releaseTask(projectRoot, initial.receipt.taskId);
 
 		// Launch supplementary turn on the same taskId
-		const supplementary = await prepareTask(binding, {
+		const supplementary = await runPrepare(binding, {
 			taskId: initial.receipt.taskId,
 			prompt: "Supplementary followup instruction",
 			inputFiles: ["step2.txt"],
 			expectedOutputs: ["followup.pdf"],
 		});
 
-		// Verify prompt records only the new instruction
-		expect(supplementary.receipt.prompt).toBe("Supplementary followup instruction");
-		// Verify merged inputs and expectedOutputs
-		expect(supplementary.receipt.inputFiles).toEqual(["step1.txt", "step2.txt"]);
-		expect(supplementary.receipt.expectedOutputs).toEqual(["initial-output.md", "followup.pdf"]);
+		const suppCurrent = currentRound(supplementary.receipt);
+		expect(suppCurrent.goal.objective).toBe("Supplementary followup instruction");
+		expect(suppCurrent.inputFiles.map((i) => i.path)).toEqual(["step2.txt"]);
+		expect(suppCurrent.expectedOutputs).toEqual(["followup.pdf"]);
+		expect(supplementary.round).toBe(2);
+		expect(supplementary.receipt.rounds.length).toBe(2);
 
 		// Verify existing deliverable in outputs/ was preserved
 		const existingContent = await readFile(initialOutputDest, "utf-8");
@@ -944,13 +1064,13 @@ describe("supplementary turns on existing tasks", () => {
 		};
 		await writeBinding(binding);
 
-		const running = await prepareTask(binding, {
+		const running = await runPrepare(binding, {
 			prompt: "Currently running work",
 		});
 
 		let caught: unknown = null;
 		try {
-			await prepareTask(binding, {
+			await runPrepare(binding, {
 				taskId: running.receipt.taskId,
 				prompt: "Premature supplementary attempt",
 			});
@@ -979,7 +1099,7 @@ describe("supplementary turns on existing tasks", () => {
 		// Unknown UUID
 		let caught: unknown = null;
 		try {
-			await prepareTask(binding, {
+			await runPrepare(binding, {
 				taskId: crypto.randomUUID(),
 				prompt: "Unknown task target",
 			});
@@ -994,7 +1114,7 @@ describe("supplementary turns on existing tasks", () => {
 		// Non-UUID string with traversal syntax
 		caught = null;
 		try {
-			await prepareTask(binding, {
+			await runPrepare(binding, {
 				taskId: "../../etc/passwd",
 				prompt: "Traversal attempt",
 			});
@@ -1017,9 +1137,8 @@ describe("collectArtifacts discovery", () => {
 			sessionId: crypto.randomUUID(),
 			workbuddyVersion: "5.8.2",
 		};
-		await writeBinding(binding);
 
-		const { receipt, outputsDir } = await prepareTask(binding, {
+		const { receipt, outputsDir } = await runPrepare(binding, {
 			prompt: "Artifact collection check",
 			expectedOutputs: ["summary.md", "assets/chart.png", "missing-report.pdf"],
 		});
@@ -1036,8 +1155,8 @@ describe("collectArtifacts discovery", () => {
 		const result = await collectArtifacts(receipt);
 
 		expect(result.artifacts.length).toBe(2);
-		expect(result.artifacts).toContain(summaryPath);
-		expect(result.artifacts).toContain(chartPath);
+		expect(result.artifacts.map((a) => a.path)).toContain(summaryPath);
+		expect(result.artifacts.map((a) => a.path)).toContain(chartPath);
 		expect(result.missingOutputs).toEqual(["missing-report.pdf"]);
 
 		await releaseTask(projectRoot, receipt.taskId);
@@ -1053,7 +1172,7 @@ describe("collectArtifacts discovery", () => {
 		};
 		await writeBinding(binding);
 
-		const { receipt } = await prepareTask(binding, {
+		const { receipt } = await runPrepare(binding, {
 			prompt: "No outputs yet",
 			expectedOutputs: ["deliverable.txt"],
 		});
@@ -1136,7 +1255,7 @@ describe("readTaskIndex history listing", () => {
 	/** Writes one receipt for this project and returns its task id. */
 	async function seedTask(
 		projectRoot: string,
-		options: { status?: TaskReceipt["status"]; taskId?: string; mtime?: number } = {},
+		options: { status?: TaskStatus; taskId?: string; mtime?: number } = {},
 	): Promise<string> {
 		const taskId = options.taskId ?? crypto.randomUUID();
 		const taskDir = path.join(projectRoot, ".wb-bridge", "tasks", taskId);

@@ -8,10 +8,17 @@
  * actual files.
  */
 import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { realpath } from "node:fs/promises";
+import { copyFile, mkdir, readFile, realpath, stat } from "node:fs/promises";
+import path from "node:path";
+import crypto from "node:crypto";
+import os from "node:os";
+import process from "node:process";
 import { connect, discover, inspectWorkers, type DesktopSession } from "./desktop-client";
+import { atomicWriteFile } from "./storage";
 import {
 	collectArtifacts,
+	computeFileSha256,
+	currentRound,
 	isPidAlive,
 	prepareTask,
 	readBinding,
@@ -24,15 +31,30 @@ import {
 	writeTask,
 } from "./tasks";
 import {
+	claimWork,
+	publishWork,
+	readAllWorkRecords,
+	readWorkRecord,
+	releaseWork,
+	withCollaborationLock,
+	writeWorkRecord,
+	type ScopeDefinition,
+} from "./collaboration";
+import {
 	type Binding,
 	type DesktopCallbacks,
 	type DesktopCandidate,
 	type DesktopSessionUpdate,
-	type TaskError,
-	type TaskReceipt,
+	type FileArtifact,
+	type PreparedTask,
+	type RoundConfirmation,
 	type StoredTaskSummary,
+	type TaskError,
+	type TaskGoal,
 	type TaskListWarning,
 	type TaskLock,
+	type TaskReceipt,
+	type TaskRequest,
 	type TaskStatus,
 	type TaskView,
 	type WorkerInspection,
@@ -79,11 +101,19 @@ const DECISION_ALLOW = "allow";
 const DECISION_DENY = "deny";
 
 /** Parameters accepted by the `wb_task` tool. */
-interface WbTaskParams {
-	prompt: string;
-	inputFiles?: string[];
-	expectedOutputs?: string[];
+type WbTaskParams = TaskRequest;
+
+interface FrozenDraft {
+	requestId: string;
+	projectRoot: string;
+	sessionId: string;
+	previousRound: number;
 	taskId?: string;
+	goal: TaskGoal;
+	inputFiles: Array<{ path: string; sha256: string }>;
+	expectedOutputs: string[];
+	rawRequest: TaskRequest;
+	createdAt: string;
 }
 
 /** Parameters accepted by the `wb_status` tool. */
@@ -143,13 +173,14 @@ export interface BridgeOverrides {
 	) => Promise<DesktopSession>;
 	prepareTask?: (
 		binding: Binding,
-		request: { prompt: string; inputFiles?: string[]; expectedOutputs?: string[]; taskId?: string },
-	) => Promise<{ receipt: TaskReceipt; briefPath: string; outputsDir: string }>;
+		request: TaskRequest,
+		confirmation: RoundConfirmation,
+	) => Promise<PreparedTask>;
 	readBinding?: (projectRoot: string) => Promise<Binding | null>;
 	writeBinding?: (binding: Binding) => Promise<void>;
 	readTask?: (projectRoot: string, taskId: string) => Promise<TaskReceipt>;
 	writeTask?: (receipt: TaskReceipt) => Promise<void>;
-	collectArtifacts?: (receipt: TaskReceipt) => Promise<{ artifacts: string[]; missingOutputs: string[] }>;
+	collectArtifacts?: (receipt: TaskReceipt) => Promise<{ artifacts: FileArtifact[]; missingOutputs: string[] }>;
 	releaseTask?: (projectRoot: string, taskId: string) => Promise<void>;
 	readTaskIndex?: (
 		projectRoot: string,
@@ -235,6 +266,7 @@ interface ActiveTask {
 	readonly pendingApprovals: Set<string>;
 	/** True while at least one approval dialog is waiting for a human. */
 	awaitingApproval: boolean;
+	turnConfirmedEnd?: boolean;
 }
 
 /** One permission request, with this client's answer shape already resolved. */
@@ -277,6 +309,8 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 	const realInspectWorkers = overrides.inspectWorkers ?? inspectWorkers;
 	const cancelSettleMs = overrides.cancelSettleMs ?? CANCEL_SETTLE_MS;
 
+	let currentDraft: FrozenDraft | null = null;
+
 	const setStatus = (ctx: ExtensionContext): void => {
 		if (!ctx.hasUI) {
 			return;
@@ -286,9 +320,6 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			return;
 		}
-		// A task is only "running" while it genuinely is: a terminal state already
-		// chosen (a commit in flight) is not work, and a retained task whose commit
-		// failed is reported as a storage problem instead.
 		const blocked = mine.filter((task) => task.storageError !== null).length;
 		const active = mine.filter(
 			(task) => task.storageError === null && task.finalization === null && !receiptIsTerminal(task.receipt),
@@ -302,13 +333,11 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 			parts.push(`storage errors (${blocked})`);
 		}
 		if (parts.length === 0) {
-			// Nothing is running here; a task in the map is mid-commit.
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			return;
 		}
 		ctx.ui.setStatus(STATUS_KEY, `WorkBuddy: ${parts.join(", ")}`);
 	};
-
 	pi.on("session_shutdown", async () => {
 		const mine = [...tasks.values()];
 		await Promise.all(
@@ -325,10 +354,131 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 		// storage failure the caller still has to see.
 	});
 
+	pi.on("session_switch", async () => {
+		currentDraft = null;
+	});
+
+	let lastGoalSync: { id: string; status: string; objective: string } | null = null;
+
+	pi.on("goal_updated", async (event: unknown) => {
+		try {
+			if (typeof event !== "object" || event === null || !("goal" in event)) {
+				return;
+			}
+			const rawGoal = (event as { goal: unknown }).goal;
+			if (typeof rawGoal !== "object" || rawGoal === null) {
+				return;
+			}
+			const goal = rawGoal as { id: string; status: string; objective: string };
+			if (
+				lastGoalSync &&
+				lastGoalSync.id === goal.id &&
+				lastGoalSync.status === goal.status &&
+				lastGoalSync.objective === goal.objective
+			) {
+				return;
+			}
+			lastGoalSync = { id: goal.id, status: goal.status, objective: goal.objective };
+
+			const projectRoot = await realpath(process.cwd()).catch(() => process.cwd());
+			const sm = (pi as unknown as { sessionManager?: { getSessionId?: () => string } }).sessionManager;
+			const sessionId = sm?.getSessionId?.() ?? "omp-session";
+			const nativeRef = { sessionId, goalId: goal.id };
+
+			if (goal.status === "complete" || goal.status === "dropped") {
+				const records = await readAllWorkRecords(projectRoot);
+				const existing = records.find(
+					(r) => r.nativeRef?.sessionId === sessionId && r.nativeRef?.goalId === goal.id && r.state !== "released"
+				);
+				if (existing) {
+					await releaseWork(projectRoot, existing.workId);
+				}
+			} else {
+				const records = await readAllWorkRecords(projectRoot);
+				const existing = records.find(
+					(r) => r.nativeRef?.sessionId === sessionId && r.nativeRef?.goalId === goal.id && r.state !== "released"
+				);
+				if (existing) {
+					const state = goal.status === "paused" || goal.status === "budget-limited" ? "blocked" : "active";
+					await publishWork(projectRoot, "omp", {
+						workId: existing.workId,
+						expectedRevision: existing.revision,
+						progress: {
+							state,
+							phase: "goal_updated",
+							milestone: goal.objective.slice(0, 240),
+							blocker: goal.status === "paused" || goal.status === "budget-limited" ? goal.status : "",
+						},
+					});
+				} else {
+					await claimWork(projectRoot, "omp", {
+						title: goal.objective.slice(0, 160),
+						scope: { readPaths: [], writePaths: [] },
+						nativeRef,
+					});
+				}
+			}
+		} catch {
+			// Best effort
+		}
+	});
+
+	pi.on("tool_result", async (event: unknown) => {
+		try {
+			if (typeof event !== "object" || event === null) {
+				return;
+			}
+			const ev = event as { toolName?: unknown; isError?: unknown; input?: unknown };
+			if (ev.toolName !== "todo" || ev.isError === true) {
+				return;
+			}
+			const input = ev.input as Record<string, unknown> | undefined;
+			if (!input || typeof input.op !== "string") {
+				return;
+			}
+			const op = input.op;
+			const taskText = typeof input.task === "string" ? input.task : "";
+			const phaseText = typeof input.phase === "string" ? input.phase : "todo";
+
+			const projectRoot = await realpath(process.cwd()).catch(() => process.cwd());
+			const sm = (pi as unknown as { sessionManager?: { getSessionId?: () => string } }).sessionManager;
+			const sessionId = sm?.getSessionId?.() ?? "omp-session";
+
+			const records = await readAllWorkRecords(projectRoot);
+			const existing = records.find(
+				(r) => r.owner === "omp" && r.nativeRef?.sessionId === sessionId && r.state !== "released"
+			);
+			if (existing) {
+				await publishWork(projectRoot, "omp", {
+					workId: existing.workId,
+					expectedRevision: existing.revision,
+					progress: {
+						state: existing.state === "blocked" ? "blocked" : "active",
+						phase: phaseText.slice(0, 160),
+						milestone: `${op}: ${taskText}`.slice(0, 240),
+						blocker: typeof input.reason === "string" ? input.reason.slice(0, 240) : "",
+					},
+				});
+			}
+		} catch {
+			// Best effort
+		}
+	});
+
+	pi.on("resources_discover", async () => {
+		const extDir = path.dirname(__dirname);
+		return {
+			skillPaths: [
+				path.join(extDir, "skills", "omp-wb-collaboration"),
+				path.join(extDir, "skills", "workbuddy-delegate"),
+			],
+		};
+	});
 	pi.registerCommand("wb", {
-		description: "Bind this project to a WorkBuddy desktop session, or show binding status",
+		description: "WorkBuddy bridge management: bind, status, send, release, setup",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
-			const subcommand = args.trim().split(/\s+/)[0] ?? "";
+			const parts = args.trim().split(/\s+/);
+			const subcommand = parts[0] ?? "";
 			if (subcommand === "bind") {
 				await runBind(ctx);
 				return;
@@ -337,32 +487,152 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 				await runStatus(ctx);
 				return;
 			}
-			ctx.ui.notify(`Unknown /wb subcommand: ${subcommand}. Use /wb bind or /wb status.`, "warning");
+			if (subcommand === "send") {
+				const targetId = parts[1] ?? "";
+				if (!targetId) {
+					ctx.ui.notify("Usage: /wb send <requestId>", "warning");
+					return;
+				}
+				const projectRoot = await realpath(ctx.cwd).catch(() => ctx.cwd);
+				if (!currentDraft || currentDraft.requestId !== targetId || currentDraft.projectRoot !== projectRoot) {
+					ctx.ui.notify(`No matching draft found for requestId "${targetId}" in this project.`, "warning");
+					return;
+				}
+				const draft = currentDraft;
+				currentDraft = null;
+
+				if (draft.goal.externalActions.length > 0 && ctx.hasUI) {
+					const actionDetails = draft.goal.externalActions
+						.map((a) => `- [${a.kind}] target: ${a.target}, operation: ${a.operation}, parameters: ${a.parameters}`)
+						.join("\n");
+					const extChoices = ["Approve these exact actions once", "Do not run external actions"];
+					const extChoice = await ctx.ui.select(
+						`Authorizing external side-effects for this round:\n${actionDetails}`,
+						extChoices,
+					);
+					if (extChoice !== "Approve these exact actions once") {
+						ctx.ui.notify("External actions not approved; round cancelled.", "warning");
+						return;
+					}
+				}
+
+				const confirmation: RoundConfirmation = {
+					source: "user_command",
+					at: new Date().toISOString(),
+					sessionId: draft.sessionId,
+					previousRound: draft.previousRound,
+					inputs: draft.inputFiles,
+				};
+				const binding = {
+					version: 1 as const,
+					projectRoot: draft.projectRoot,
+					sessionId: draft.sessionId,
+					workbuddyVersion: "5.8.2",
+				};
+				const result = await runConfirmedTask(ctx, binding, draft.rawRequest, confirmation, undefined);
+				if (result.isError) {
+					const firstContent = result.content[0];
+					const errText = firstContent && "text" in firstContent && typeof firstContent.text === "string" ? firstContent.text : "error";
+					ctx.ui.notify(`Task submission failed: ${errText}`, "error");
+				} else {
+					ctx.ui.notify(`Task submitted to WorkBuddy: ${draft.taskId ?? "new task"}`, "info");
+				}
+				return;
+			}
+			if (subcommand === "release") {
+				const targetWorkId = parts[1] ?? "";
+				if (!targetWorkId) {
+					ctx.ui.notify("Usage: /wb release <workId>", "warning");
+					return;
+				}
+				const projectRoot = await realpath(ctx.cwd).catch(() => ctx.cwd);
+				if (tasks.has(targetWorkId)) {
+					ctx.ui.notify(`Cannot release scope for task ${targetWorkId} currently active in this process`, "error");
+					return;
+				}
+				try {
+					const existingRec = await readWorkRecord(projectRoot, targetWorkId);
+					if (existingRec === null) {
+						const histReceipt = await realReadTask(projectRoot, targetWorkId).catch(() => null);
+						if (histReceipt) {
+							const histRound = currentRound(histReceipt);
+							await publishWork(projectRoot, "omp", {
+								workId: targetWorkId,
+								expectedRevision: null,
+								review: {
+									round: histRound.number,
+									artifacts: [],
+									verdict: "unverified",
+									note: "Historic task scope released by human command",
+								},
+								release: true,
+							});
+							ctx.ui.notify(`Released historic scope for ${targetWorkId}.`, "info");
+							return;
+						}
+						ctx.ui.notify(`Work record ${targetWorkId} does not exist.`, "warning");
+						return;
+					}
+					await releaseWork(projectRoot, targetWorkId);
+					ctx.ui.notify(`Released collaboration scope for ${targetWorkId}.`, "info");
+				} catch (err) {
+					ctx.ui.notify(`Failed to release scope: ${messageOf(err)}`, "error");
+				}
+				return;
+			}
+			if (subcommand === "setup") {
+				await runSetup(ctx);
+				return;
+			}
+			ctx.ui.notify(`Unknown /wb subcommand: ${subcommand}. Use /wb bind, /wb status, /wb send, /wb release, or /wb setup.`, "warning");
 		},
 	});
+
+	const goalSchemaObj = pi.zod.object({
+		objective: pi.zod.string().describe("The objective and professional intent"),
+		context: pi.zod.string().optional().describe("Background context for the task"),
+		constraints: pi.zod.array(pi.zod.string()).optional().describe("Execution constraints and boundaries"),
+		acceptance: pi.zod.array(pi.zod.string()).describe("Specific acceptance criteria (at least one required)"),
+		externalActions: pi.zod
+			.array(
+				pi.zod.object({
+					kind: typeof pi.zod.enum === "function" ? pi.zod.enum(["publish", "deploy", "cloud_write", "schedule"]) : pi.zod.string(),
+					target: pi.zod.string().describe("Target system or resource"),
+					operation: pi.zod.string().describe("Operation name"),
+					parameters: pi.zod.string().describe("Critical operation parameters"),
+				})
+			)
+			.optional()
+			.describe("Planned external actions requiring separate human confirmation"),
+	});
+	const taskGoalSchema = typeof goalSchemaObj.strict === "function" ? goalSchemaObj.strict() : goalSchemaObj;
+	const describedGoal = typeof taskGoalSchema.describe === "function" ? taskGoalSchema.describe("Task objective, context, constraints, acceptance, and external actions") : taskGoalSchema;
+
+	const taskParamsObj = pi.zod.object({
+		goal: describedGoal,
+		inputFiles: pi.zod
+			.array(pi.zod.string())
+			.optional()
+			.describe("Project-relative paths of real files to snapshot into the task's inputs directory"),
+		expectedOutputs: pi.zod
+			.array(pi.zod.string())
+			.optional()
+			.describe("Filenames WorkBuddy must produce in the task's outputs directory, e.g. report.md"),
+		taskId: pi.zod
+			.string()
+			.optional()
+			.describe("Existing finished task to supplement with more work on the same session"),
+	});
+	const taskParamsSchema = typeof taskParamsObj.strict === "function" ? taskParamsObj.strict() : taskParamsObj;
 
 	pi.registerTool({
 		name: "wb_task",
 		label: "WorkBuddy Task",
 		description:
 			"Delegate one self-contained task (research, office documents, design) to the project's dedicated WorkBuddy desktop session. Returns immediately with a taskId; poll it with wb_status. Declare deliverables in expectedOutputs.",
-		parameters: pi.zod.object({
-			prompt: pi.zod.string().describe("The instruction for WorkBuddy, stating the objective concretely"),
-			inputFiles: pi.zod
-				.array(pi.zod.string())
-				.optional()
-				.describe("Project-relative paths of real files to snapshot into the task's inputs directory"),
-			expectedOutputs: pi.zod
-				.array(pi.zod.string())
-				.optional()
-				.describe("Filenames WorkBuddy must produce in the task's outputs directory, e.g. report.md"),
-			taskId: pi.zod
-				.string()
-				.optional()
-				.describe("Existing finished task to supplement with more work on the same session"),
-		}),
+		parameters: taskParamsSchema,
 		execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
-			return await runTask(ctx, signal, params as WbTaskParams);
+			return await runTask(ctx, signal, params as unknown as TaskRequest);
 		},
 	});
 
@@ -442,8 +712,8 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 	 */
 	function finalizeTask(
 		task: ActiveTask,
-		status: TaskReceipt["status"],
-		error: TaskReceipt["error"],
+		status: TaskStatus,
+		error: TaskError | null,
 		options: { cancelWorker?: boolean; collectArtifacts?: boolean } = {},
 	): Promise<void> {
 		const existing = task.finalization;
@@ -458,11 +728,11 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 
 		// Everything below runs with no `await` in between, so the state observed
 		// here is the state the commit works from.
-		task.receipt.status = status;
-		task.receipt.error = error;
-		task.receipt.summary = task.summary.trim();
+		const current = currentRound(task.receipt);
+		current.status = status;
+		current.error = error;
+		current.summary = task.summary.trim();
 		task.awaitingApproval = false;
-		// Dialogs may still be open; they are told to end and cannot re-set the flag.
 		task.pendingApprovals.clear();
 		setStatus(task.ctx);
 
@@ -499,33 +769,56 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 				}
 
 				if (options.collectArtifacts === true) {
-					// Whatever WorkBuddy already wrote stays with the task; a failed scan
-					// keeps the previous list rather than discarding real files.
 					const collected = await realCollectArtifacts(task.receipt).catch(() => null);
 					if (collected !== null) {
-						task.receipt.artifacts = collected.artifacts;
+						const currentR = currentRound(task.receipt);
+						currentR.artifacts = collected.artifacts;
 					}
 				}
 
-				// A shallow snapshot is what gets committed, so the bytes on disk are
-				// exactly the state decided here rather than whatever the receipt looks
-				// like by the time the write lands.
-				const snapshot: TaskReceipt = { ...task.receipt, artifacts: [...task.receipt.artifacts] };
+				const snapshot: TaskReceipt = {
+					...task.receipt,
+					rounds: task.receipt.rounds.map((r) => ({
+						...r,
+						inputFiles: [...r.inputFiles],
+						expectedOutputs: [...r.expectedOutputs],
+						artifacts: [...r.artifacts],
+					})),
+				};
 
 				try {
 					await realWriteTask(snapshot);
 				} catch (err: unknown) {
-					// Nothing was committed, so the lock stays: releasing it would let the
-					// next task start beside a receipt that still looks alive.
 					task.storageError = taskError(WB_ERROR_CODE.storageError, messageOf(err));
 					reportStorageFailure(pi, task, "receipt write");
 					return;
 				}
 
 				try {
+					const isCleanEnd = status === "completed" || (task.turnConfirmedEnd === true && !options.cancelWorker);
+					if (isCleanEnd) {
+						await releaseWork(task.receipt.projectRoot, task.taskId).catch(() => null);
+					} else {
+						await withCollaborationLock(task.receipt.projectRoot, async () => {
+							const existingRec = await readWorkRecord(task.receipt.projectRoot, task.taskId);
+							if (existingRec && existingRec.state !== "released") {
+								existingRec.state = "blocked";
+								existingRec.blocker = status;
+								existingRec.updatedAt = new Date().toISOString();
+								existingRec.revision += 1;
+								await writeWorkRecord(existingRec);
+							}
+						}).catch(() => null);
+					}
+				} catch (err: unknown) {
+					task.storageError = taskError(WB_ERROR_CODE.storageError, messageOf(err));
+					reportStorageFailure(pi, task, "scope update");
+					return;
+				}
+
+				try {
 					await realReleaseTask(task.receipt.projectRoot, task.taskId);
 				} catch (err: unknown) {
-					// The terminal receipt is durable; only the slot is still held.
 					task.storageError = taskError(WB_ERROR_CODE.storageError, messageOf(err));
 					reportStorageFailure(pi, task, "lock release");
 					return;
@@ -533,8 +826,6 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 
 				tasks.delete(task.taskId);
 			} catch (err: unknown) {
-				// Reaching here means the commit itself failed unexpectedly; the task
-				// stays in the map with the failure recorded rather than vanishing.
 				task.storageError = taskError(WB_ERROR_CODE.storageError, messageOf(err));
 				reportStorageFailure(pi, task, "terminal commit");
 			} finally {
@@ -670,7 +961,7 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 			mine.length === 0
 				? "Active tasks in this OMP session: none."
 				: `Active tasks in this OMP session: ${mine
-						.map((task) => `${task.taskId} (${task.receipt.status})`)
+						.map((task) => `${task.taskId} (${currentRound(task.receipt).status})`)
 						.join(", ")}`,
 		);
 		ctx.ui.notify(lines.join("\n"), "info");
@@ -717,16 +1008,254 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 		}
 		const { binding, projectRoot } = resolved;
 
-		let prepared;
+		if (typeof params.goal !== "object" || params.goal === null) {
+			return failureResult("Task goal must be an object", WB_ERROR_CODE.inputInvalid);
+		}
+		if (typeof params.goal.objective !== "string" || params.goal.objective.trim().length === 0) {
+			return failureResult("Task objective must be a non-empty string", WB_ERROR_CODE.inputInvalid);
+		}
+		if (
+			!Array.isArray(params.goal.acceptance) ||
+			params.goal.acceptance.length === 0 ||
+			params.goal.acceptance.some((a) => typeof a !== "string" || a.trim().length === 0)
+		) {
+			return failureResult("Task goal must have at least one non-empty acceptance criterion", WB_ERROR_CODE.inputInvalid);
+		}
+
+		let previousRound = 0;
+		if (params.taskId !== undefined) {
+			let existingReceipt: TaskReceipt;
+			try {
+				existingReceipt = await realReadTask(projectRoot, params.taskId);
+			} catch (error) {
+				return failureResult(messageOf(error), codeOf(error));
+			}
+			const current = currentRound(existingReceipt);
+			if (current.status === "running" || current.status === "awaiting_approval") {
+				return failureResult(
+					`Task ${params.taskId} is currently ${current.status}; supplementary work requires a terminal state`,
+					WB_ERROR_CODE.busy,
+				);
+			}
+			previousRound = existingReceipt.rounds.length;
+		}
+
+		// Validate and snapshot inputs
+		const snapshottedInputs: Array<{ path: string; sha256: string }> = [];
+		if (params.inputFiles && params.inputFiles.length > 0) {
+			const seen = new Set<string>();
+			for (const rawInput of params.inputFiles) {
+				if (typeof rawInput !== "string" || rawInput.trim().length === 0) {
+					return failureResult("Input file path must be a non-empty string", WB_ERROR_CODE.inputInvalid);
+				}
+				if (
+					path.isAbsolute(rawInput) ||
+					rawInput.startsWith("/") ||
+					rawInput.startsWith("\\") ||
+					/^[a-zA-Z]:/.test(rawInput)
+				) {
+					return failureResult(`Input file path must be relative: "${rawInput}"`, WB_ERROR_CODE.inputInvalid);
+				}
+				if (rawInput.split(/[/\\]/).some((s) => s === "..")) {
+					return failureResult(`Input file path contains '..' traversal: "${rawInput}"`, WB_ERROR_CODE.inputInvalid);
+				}
+				const resolvedInput = path.resolve(projectRoot, rawInput);
+				let st;
+				try {
+					st = await stat(resolvedInput);
+				} catch {
+					return failureResult(`Input file does not exist: "${rawInput}"`, WB_ERROR_CODE.inputInvalid);
+				}
+				if (!st.isFile()) {
+					return failureResult(`Input file is not a regular file: "${rawInput}"`, WB_ERROR_CODE.inputInvalid);
+				}
+				let targetReal: string;
+				try {
+					targetReal = await realpath(resolvedInput);
+				} catch {
+					return failureResult(`Input file realpath resolution failed: "${rawInput}"`, WB_ERROR_CODE.inputInvalid);
+				}
+				const relFromRoot = path.relative(projectRoot, targetReal);
+				if (relFromRoot.startsWith("..") || path.isAbsolute(relFromRoot) || relFromRoot === "") {
+					return failureResult(`Input file resolves outside project root: "${rawInput}"`, WB_ERROR_CODE.inputInvalid);
+				}
+				const normalized = path.normalize(rawInput).split(path.sep).join("/");
+				if (!seen.has(normalized)) {
+					seen.add(normalized);
+					const fileHash = await computeFileSha256(targetReal);
+					snapshottedInputs.push({ path: normalized, sha256: fileHash });
+				}
+			}
+		}
+
+		// Validate expectedOutputs
+		const validatedOutputs: string[] = [];
+		if (params.expectedOutputs && params.expectedOutputs.length > 0) {
+			const seenOut = new Set<string>();
+			for (const rawOut of params.expectedOutputs) {
+				if (typeof rawOut !== "string" || rawOut.trim().length === 0) {
+					return failureResult("Expected output path must be a non-empty string", WB_ERROR_CODE.inputInvalid);
+				}
+				if (
+					path.isAbsolute(rawOut) ||
+					rawOut.startsWith("/") ||
+					rawOut.startsWith("\\") ||
+					/^[a-zA-Z]:/.test(rawOut)
+				) {
+					return failureResult(`Expected output path must be relative: "${rawOut}"`, WB_ERROR_CODE.inputInvalid);
+				}
+				if (rawOut.split(/[/\\]/).some((s) => s === "..")) {
+					return failureResult(`Expected output path contains '..' traversal: "${rawOut}"`, WB_ERROR_CODE.inputInvalid);
+				}
+				const normalized = path.normalize(rawOut).split(path.sep).join("/");
+				if (!seenOut.has(normalized)) {
+					seenOut.add(normalized);
+					validatedOutputs.push(normalized);
+				}
+			}
+		}
+
+		const goal: TaskGoal = {
+			objective: params.goal.objective,
+			context: params.goal.context ?? "",
+			constraints: params.goal.constraints ?? [],
+			acceptance: params.goal.acceptance,
+			externalActions: params.goal.externalActions ?? [],
+		};
+
+		const requestId = crypto.randomUUID();
+		const draft: FrozenDraft = {
+			requestId,
+			projectRoot,
+			sessionId: binding.sessionId,
+			previousRound,
+			taskId: params.taskId,
+			goal,
+			inputFiles: snapshottedInputs,
+			expectedOutputs: validatedOutputs,
+			rawRequest: { ...params, goal },
+			createdAt: new Date().toISOString(),
+		};
+		currentDraft = draft;
+
+		if (!ctx.hasUI) {
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Human confirmation required before submitting to WorkBuddy.\nRequestId: ${requestId}\nRun /wb send ${requestId} in OMP to confirm and submit this round.`,
+					},
+				],
+				details: {
+					decision: "needs_confirmation",
+					requestId,
+					goal: draft.goal,
+					inputFiles: draft.inputFiles.map((i) => i.path),
+					expectedOutputs: draft.expectedOutputs,
+				},
+				isError: true,
+			};
+		}
+
+		const promptDetails = [
+			`Objective: ${draft.goal.objective}`,
+			draft.goal.context ? `Context: ${draft.goal.context}` : undefined,
+			draft.goal.constraints.length > 0 ? `Constraints: ${draft.goal.constraints.join("; ")}` : undefined,
+			`Acceptance: ${draft.goal.acceptance.join("; ")}`,
+			draft.inputFiles.length > 0 ? `Inputs: ${draft.inputFiles.map((i) => i.path).join(", ")}` : undefined,
+			draft.expectedOutputs.length > 0 ? `Expected Outputs: ${draft.expectedOutputs.join(", ")}` : undefined,
+			draft.goal.externalActions.length > 0
+				? `External Actions: ${draft.goal.externalActions.map((a) => `[${a.kind}] ${a.target} (${a.operation})`).join(", ")}`
+				: undefined,
+		]
+			.filter((l): l is string => l !== undefined)
+			.join("\n");
+
+		const targetChoices = ["Submit this round", "Keep in OMP", "Cancel"];
+		const targetChoice = await ctx.ui.select(
+			`Confirm WorkBuddy delegation round:\n${promptDetails}`,
+			targetChoices,
+			signal ? { signal } : undefined,
+		);
+
+		if (signal?.aborted || currentDraft?.requestId !== requestId || currentDraft?.projectRoot !== projectRoot) {
+			currentDraft = null;
+			return {
+				content: [{ type: "text", text: "Delegation cancelled." }],
+				details: { decision: "cancelled" },
+				isError: false,
+			};
+		}
+
+		if (targetChoice === "Keep in OMP") {
+			currentDraft = null;
+			return {
+				content: [{ type: "text", text: "Task kept in OMP; not delegated to WorkBuddy." }],
+				details: { decision: "keep_in_omp" },
+				isError: false,
+			};
+		}
+
+		if (targetChoice !== "Submit this round") {
+			currentDraft = null;
+			return {
+				content: [{ type: "text", text: "Delegation cancelled by user." }],
+				details: { decision: "cancelled" },
+				isError: false,
+			};
+		}
+
+		if (draft.goal.externalActions.length > 0) {
+			const actionDetails = draft.goal.externalActions
+				.map((a) => `- [${a.kind}] target: ${a.target}, operation: ${a.operation}, parameters: ${a.parameters}`)
+				.join("\n");
+			const extChoices = ["Approve these exact actions once", "Do not run external actions"];
+			const extChoice = await ctx.ui.select(
+				`Authorizing external side-effects for this round:\n${actionDetails}`,
+				extChoices,
+				signal ? { signal } : undefined,
+			);
+
+			if (
+				signal?.aborted ||
+				currentDraft?.requestId !== requestId ||
+				extChoice !== "Approve these exact actions once"
+			) {
+				currentDraft = null;
+				return failureResult(
+					"External actions not approved by human; round will not be submitted",
+					WB_ERROR_CODE.approvalUnsupported,
+				);
+			}
+		}
+
+		const confirmation: RoundConfirmation = {
+			source: "host_dialog",
+			at: new Date().toISOString(),
+			sessionId: binding.sessionId,
+			previousRound: draft.previousRound,
+			inputs: draft.inputFiles,
+		};
+		currentDraft = null;
+
+		return await runConfirmedTask(ctx, binding, draft.rawRequest, confirmation, signal);
+	}
+
+	async function runConfirmedTask(
+		ctx: ExtensionContext,
+		binding: Binding,
+		request: TaskRequest,
+		confirmation: RoundConfirmation,
+		signal: AbortSignal | undefined,
+	): Promise<AgentToolResult<unknown>> {
+		let prepared: PreparedTask;
 		try {
-			prepared = await realPrepareTask(binding, params);
+			prepared = await realPrepareTask(binding, request, confirmation);
 		} catch (error) {
 			return failureResult(messageOf(error), codeOf(error));
 		}
 		const { receipt } = prepared;
 
-		// The turn outlives this tool call, so its lifetime follows the session;
-		// the caller's own signal still stops it.
 		const abort = new AbortController();
 		if (signal?.aborted === true) {
 			abort.abort();
@@ -734,22 +1263,9 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 			signal?.addEventListener("abort", () => abort.abort(), { once: true });
 		}
 
-		// The commit signal exists from construction so a waiter that parks before
-		// any terminal state is chosen is still released, and it never rejects.
-		let markCommitted!: () => void;
-		const committed = new Promise<void>((resolve) => {
-			markCommitted = resolve;
-		});
+		const { promise: committed, resolve: markCommitted } = Promise.withResolvers<void>();
+		const { promise: turnEnded, resolve: markTurnEnded } = Promise.withResolvers<void>();
 
-		// The turn-ended signal also exists from construction: a cancellation that
-		// lands before the turn even starts still needs something to wait on.
-		let markTurnEnded!: () => void;
-		const turnEnded = new Promise<void>((resolve) => {
-			markTurnEnded = resolve;
-		});
-
-		// The task is tracked from before its connection exists, so an update that
-		// arrives during the handshake, a cancellation and a shutdown all find it.
 		const task: ActiveTask = {
 			taskId: receipt.taskId,
 			receipt,
@@ -772,6 +1288,34 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 		tasks.set(receipt.taskId, task);
 		setStatus(ctx);
 
+		// Register scope via collaboration store
+		const currentR = currentRound(receipt);
+		const relOutputs = path.relative(binding.projectRoot, prepared.outputsDir).split(path.sep).join("/");
+		const scopeDefinition: ScopeDefinition = {
+			readPaths: currentR.inputFiles.map((i) => i.path),
+			writePaths: [relOutputs],
+		};
+
+		try {
+			await claimWork(binding.projectRoot, "workbuddy", {
+				workId: receipt.taskId,
+				taskId: receipt.taskId,
+				round: prepared.round,
+				title: currentR.goal.objective,
+				scope: scopeDefinition,
+			});
+		} catch (scopeErr) {
+			await finalizeTask(
+				task,
+				"failed",
+				taskError(
+					scopeErr instanceof WbTaskError ? scopeErr.code : WB_ERROR_CODE.scopeConflict,
+					messageOf(scopeErr),
+				),
+			);
+			return taskResult(toTaskView(task.receipt, task));
+		}
+
 		let session: DesktopSession;
 		try {
 			session = await realConnect(
@@ -785,19 +1329,11 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 				abort.signal,
 			);
 		} catch (error) {
-			// No turn ever started, so nothing can be waited on: a cancellation must
-			// release the connection immediately rather than spend the settle budget.
 			task.markTurnEnded();
-			// Nothing was delivered, so the task must not be left looking alive. The
-			// view carries the taskId so the caller can still find the failed task,
-			// and it reports its own failure semantics (a cancellation that raced
-			// the handshake stays a cancellation, not a failure).
 			await finalizeTask(task, "failed", taskError(codeOf(error), messageOf(error)));
 			return taskResult(toTaskView(task.receipt, task));
 		}
 
-		// A cancellation or shutdown may have finished while the handshake was in
-		// flight; the late connection is then closed without ever sending a prompt.
 		if (task.finalization !== null || abort.signal.aborted) {
 			task.markTurnEnded();
 			await session.close().catch(() => undefined);
@@ -808,15 +1344,21 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 			);
 			return taskResult(toTaskView(task.receipt, task));
 		}
-		task.session = session;
-		task.settled = runTurn(task, prepared.briefPath);
 
+		task.session = session;
+		let promptText: string;
+		try {
+			promptText = await readFile(prepared.briefPath, "utf-8");
+		} catch {
+			promptText = request.goal.objective;
+		}
+		task.settled = runTurn(task, promptText);
 		return {
 			content: [
 				{
 					type: "text",
 					text: [
-						`Delegated to WorkBuddy as task ${receipt.taskId}.`,
+						`Delegated to WorkBuddy as task ${receipt.taskId} (round ${prepared.round}).`,
 						`Poll with wb_status({ taskId: "${receipt.taskId}" }).`,
 						`WorkBuddy writes deliverables to ${prepared.outputsDir}.`,
 					].join("\n"),
@@ -824,14 +1366,14 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 			],
 			details: {
 				taskId: receipt.taskId,
-				status: receipt.status,
+				round: prepared.round,
+				status: currentR.status,
 				briefPath: prepared.briefPath,
 				outputsDir: prepared.outputsDir,
 			},
 		};
 	}
 
-	/** Drives one turn to its terminal state. */
 	async function runTurn(task: ActiveTask, prompt: string): Promise<void> {
 		let outcome: { stopReason: string; errorMessage?: string };
 		try {
@@ -841,14 +1383,7 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 			}
 			outcome = await session.prompt(prompt);
 		} catch (error) {
-			// The turn is over (its stream died), so a cancellation waiting on it can
-			// release the connection. Marked before the commit: the commit may await
-			// other work, and the wait exists to let the worker finish, not to wait
-			// for our own bookkeeping.
 			task.markTurnEnded();
-			// A stream that dies mid-turn leaves WorkBuddy's real work intact, so the
-			// partial reply and any files already written are kept. A commit that
-			// already started wins: this only waits for it.
 			await finalizeTask(
 				task,
 				"interrupted",
@@ -857,12 +1392,9 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 			);
 			return;
 		}
-		// The prompt call returned, so the worker reported the turn's outcome.
 		task.markTurnEnded();
 
 		if (task.finalization !== null) {
-			// A cancellation, second terminal path or shutdown already chose the
-			// outcome; the turn is only observed from here on.
 			await task.finalization;
 			return;
 		}
@@ -883,8 +1415,8 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 			return;
 		}
 
-		// The deliverables are scanned before success is claimed, because a missing
-		// expected output is a failure even when the turn ended cleanly.
+		task.turnConfirmedEnd = true;
+
 		const collected = await realCollectArtifacts(task.receipt).catch(() => null);
 		if (collected === null) {
 			await finalizeTask(
@@ -895,24 +1427,237 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 			return;
 		}
 		if (task.finalization !== null) {
-			// The scan is async, so a cancellation may have landed meanwhile; it owns
-			// the outcome and the artifacts it snapshotted.
 			await task.finalization;
 			return;
 		}
-		task.receipt.artifacts = collected.artifacts;
-		if (collected.missingOutputs.length > 0) {
+		const current = currentRound(task.receipt);
+		current.artifacts = collected.artifacts;
+		const missingOutputs = Array.isArray(collected.missingOutputs) ? collected.missingOutputs : [];
+		if (missingOutputs.length > 0) {
 			await finalizeTask(
 				task,
 				"failed",
 				taskError(
 					WB_ERROR_CODE.outputMissing,
-					`WorkBuddy finished but these expected outputs are missing: ${collected.missingOutputs.join(", ")}`,
+					`WorkBuddy finished but these expected outputs are missing: ${missingOutputs.join(", ")}`,
 				),
 			);
 			return;
 		}
 		await finalizeTask(task, "completed", null);
+	}
+	async function updateMcpConfigFile(
+		configPath: string,
+		serviceName: string,
+		newEntry: { command: string; args: string[] },
+		projectRoot: string,
+		selectHandler?: (message: string, choices: string[]) => Promise<string | undefined>,
+	): Promise<{ success: boolean; error?: string }> {
+		let rawContent: string | null = null;
+		let isMissing = false;
+
+		try {
+			rawContent = await readFile(configPath, "utf-8");
+		} catch (err: unknown) {
+			if (typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT") {
+				isMissing = true;
+			} else {
+				return {
+					success: false,
+					error: `Cannot read MCP config at ${configPath}: ${messageOf(err)}`,
+				};
+			}
+		}
+
+		let configObj: Record<string, unknown> = {};
+
+		if (isMissing) {
+			configObj = { mcpServers: {} };
+		} else {
+			try {
+				const parsed: unknown = JSON.parse(rawContent!);
+				if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+					return {
+						success: false,
+						error: `Malformed MCP config at ${configPath}: root must be a JSON object`,
+					};
+				}
+				configObj = parsed as Record<string, unknown>;
+			} catch (err) {
+				return {
+					success: false,
+					error: `Invalid JSON in MCP config at ${configPath}: ${messageOf(err)}`,
+				};
+			}
+		}
+
+		let mcpServers: Record<string, unknown>;
+		if ("mcpServers" in configObj) {
+			if (
+				typeof configObj.mcpServers !== "object" ||
+				configObj.mcpServers === null ||
+				Array.isArray(configObj.mcpServers)
+			) {
+				return {
+					success: false,
+					error: `Malformed MCP config at ${configPath}: "mcpServers" must be an object`,
+				};
+			}
+			mcpServers = configObj.mcpServers as Record<string, unknown>;
+		} else {
+			mcpServers = {};
+			configObj.mcpServers = mcpServers;
+		}
+
+		if (serviceName in mcpServers) {
+			const existing = mcpServers[serviceName];
+			if (typeof existing !== "object" || existing === null) {
+				return {
+					success: false,
+					error: `Conflicting non-object "${serviceName}" entry in ${configPath}`,
+				};
+			}
+			const existingObj = existing as { command?: unknown; args?: unknown };
+			if (!Array.isArray(existingObj.args)) {
+				return {
+					success: false,
+					error: `Conflicting "${serviceName}" entry in ${configPath}: args must be an array`,
+				};
+			}
+			const argsArray = existingObj.args.map(String);
+			const targetEntrypoint = newEntry.args[0]!;
+			const hasEntrypoint = argsArray.some((arg) => path.resolve(arg) === path.resolve(targetEntrypoint));
+			const hasProjectFlag = argsArray.includes("--project");
+			const hasAgentFlag = argsArray.includes("--agent");
+			if (!hasEntrypoint || !hasProjectFlag || !hasAgentFlag) {
+				return {
+					success: false,
+					error: `Conflicting "${serviceName}" in ${configPath} does not match this bridge installation; refusing to overwrite foreign entry`,
+				};
+			}
+
+			const projIndex = argsArray.indexOf("--project");
+			const currentBoundProj = projIndex !== -1 ? argsArray[projIndex + 1] : undefined;
+			if (currentBoundProj && currentBoundProj !== projectRoot) {
+				if (!selectHandler) {
+					return {
+						success: false,
+						error: `Global entry in ${configPath} is bound to another project (${currentBoundProj}); cannot rebind without interactive UI`,
+					};
+				}
+				const replaceChoice = await selectHandler(
+					`Global MCP entry in ${configPath} is bound to ${currentBoundProj}.\nReplace binding with ${projectRoot}?`,
+					["Replace with current project", "Cancel"],
+				);
+				if (replaceChoice !== "Replace with current project") {
+					return {
+						success: false,
+						error: `Rebinding cancelled by user for ${configPath}`,
+					};
+				}
+			}
+		}
+
+		mcpServers[serviceName] = newEntry;
+
+		if (!isMissing) {
+			try {
+				const checkContent = await readFile(configPath, "utf-8");
+				if (checkContent !== rawContent) {
+					return {
+						success: false,
+						error: `Concurrent modification detected on ${configPath}; refusing to overwrite`,
+					};
+				}
+			} catch (err) {
+				return {
+					success: false,
+					error: `Failed to re-read ${configPath} prior to write: ${messageOf(err)}`,
+				};
+			}
+		}
+
+		await atomicWriteFile(path.dirname(configPath), configPath, JSON.stringify(configObj, null, 2));
+		return { success: true };
+	}
+
+	async function runSetup(ctx: ExtensionCommandContext): Promise<void> {
+		let projectRoot: string;
+		try {
+			projectRoot = await realpath(ctx.cwd);
+		} catch (err) {
+			ctx.ui.notify(`Cannot resolve project root: ${messageOf(err)}`, "error");
+			return;
+		}
+
+		const repoRoot = path.dirname(__dirname);
+		const mcpEntrypoint = path.resolve(repoRoot, "src", "mcp.ts");
+		const bunExe = process.execPath;
+
+		const ompMcpPath = path.join(projectRoot, ".omp", "mcp.json");
+		const homeDir = process.env.USERPROFILE || process.env.HOME || os.homedir();
+		const wbMcpPath = path.join(homeDir, ".workbuddy", "mcp.json");
+
+		const ompEntry = {
+			command: bunExe,
+			args: [mcpEntrypoint, "--project", projectRoot, "--agent", "omp"],
+		};
+		const wbEntry = {
+			command: bunExe,
+			args: [mcpEntrypoint, "--project", projectRoot, "--agent", "workbuddy"],
+		};
+
+		const previewLines = [
+			`Project: ${projectRoot}`,
+			`MCP Entrypoint: ${mcpEntrypoint}`,
+			`Bun: ${bunExe}`,
+			`Target 1 (OMP project config): ${ompMcpPath}`,
+			`Target 2 (WorkBuddy global config): ${wbMcpPath}`,
+			`Service Name: omp-wb-bridge`,
+		];
+
+		if (!ctx.hasUI) {
+			ctx.ui.notify(previewLines.join("\n"), "info");
+			return;
+		}
+
+		const choice = await ctx.ui.select(
+			`Apply MCP configuration for project?\n${previewLines.join("\n")}`,
+			["Apply MCP configuration", "Cancel"],
+		);
+
+		if (choice !== "Apply MCP configuration") {
+			ctx.ui.notify("Setup cancelled by user.", "info");
+			return;
+		}
+
+		const ompUpdate = await updateMcpConfigFile(ompMcpPath, "omp-wb-bridge", ompEntry, projectRoot);
+		if (!ompUpdate.success) {
+			ctx.ui.notify(`Failed to update OMP config: ${ompUpdate.error}`, "error");
+			return;
+		}
+
+		const wbUpdate = await updateMcpConfigFile(
+			wbMcpPath,
+			"omp-wb-bridge",
+			wbEntry,
+			projectRoot,
+			(msg, choices) => ctx.ui.select(msg, choices),
+		);
+		if (!wbUpdate.success) {
+			ctx.ui.notify(`Failed to update WorkBuddy config: ${wbUpdate.error}`, "error");
+			return;
+		}
+		try {
+			const skillSrc = path.join(repoRoot, "skills", "omp-wb-collaboration", "SKILL.md");
+			const skillDest = path.join(projectRoot, ".workbuddy", "skills", "omp-wb-collaboration", "SKILL.md");
+			await mkdir(path.dirname(skillDest), { recursive: true });
+			await copyFile(skillSrc, skillDest);
+		} catch {
+			// Best effort
+		}
+
+		ctx.ui.notify("Successfully configured MCP for OMP and WorkBuddy.", "info");
 	}
 
 	/** Applies one WorkBuddy session update to a task's in-memory state. */
@@ -1086,7 +1831,8 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 			} catch (error) {
 				return failureResult(messageOf(error), codeOf(error));
 			}
-			if (receipt.status === "running" || receipt.status === "awaiting_approval") {
+			const currentR = currentRound(receipt);
+			if (currentR.status === "running" || currentR.status === "awaiting_approval") {
 				return failureResult(
 					`Task ${params.taskId} is still running but is not owned by this OMP process. Refusing to cancel it.`,
 					WB_ERROR_CODE.busy,
@@ -1397,6 +2143,7 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 			rows.push({
 				taskId: entry.taskId,
 				sessionId: mine ? live.receipt.sessionId : entry.sessionId,
+				round: mine ? toTaskView(live.receipt, live).round : entry.round,
 				status: mine ? toTaskView(live.receipt, live).status : entry.status,
 				updatedAt: entry.updatedAt,
 				ownedByCurrentProcess: mine,
@@ -1618,13 +2365,13 @@ function summarizeToolInput(input: unknown): string {
 	return text.length > APPROVAL_INPUT_LIMIT ? `${text.slice(0, APPROVAL_INPUT_LIMIT)}…` : text;
 }
 
-/** True when a receipt has already reached a state that must not be rewritten. */
 function receiptIsTerminal(receipt: TaskReceipt): boolean {
+	const current = currentRound(receipt);
 	return (
-		receipt.status === "completed" ||
-		receipt.status === "cancelled" ||
-		receipt.status === "failed" ||
-		receipt.status === "interrupted"
+		current.status === "completed" ||
+		current.status === "cancelled" ||
+		current.status === "failed" ||
+		current.status === "interrupted"
 	);
 }
 
@@ -1687,23 +2434,19 @@ function describeCandidate(candidate: DesktopCandidate): string {
  */
 function toTaskView(receipt: TaskReceipt, task?: ActiveTask): TaskView {
 	const live = task !== undefined;
-	const awaitingApproval = live ? task.awaitingApproval : receipt.status === "awaiting_approval";
-	// A live task that is waiting for a human is reported in the same
-	// `awaiting_approval` state the receipt format already uses, so callers do not
-	// need a second field to tell "working" from "blocked on a decision". A
-	// terminal state always wins: a decided task is not waiting for anything.
-	const status: TaskStatus =
-		!receiptIsTerminal(receipt) && awaitingApproval ? "awaiting_approval" : receipt.status;
+	const current = currentRound(receipt);
+	const awaitingApproval = live ? task.awaitingApproval : current.status === "awaiting_approval";
+	const isTerm = receiptIsTerminal(receipt);
+	const status: TaskStatus = !isTerm && awaitingApproval ? "awaiting_approval" : current.status;
 	return {
 		taskId: receipt.taskId,
 		sessionId: receipt.sessionId,
+		round: current.number,
 		status,
-		summary: live ? task.summary.trim() : receipt.summary,
-		artifacts: [...receipt.artifacts],
-		error: receipt.error,
+		summary: live ? task.summary.trim() : current.summary,
+		artifacts: [...current.artifacts],
+		error: current.error,
 		progress: live ? task.progress : "",
-		// Only the live view can say whether somebody is being asked right now; a
-		// stored snapshot only records that the task was waiting when it was written.
 		awaitingApproval,
 		ownedByCurrentProcess: live,
 		storageError: live ? task.storageError : null,
@@ -1713,7 +2456,7 @@ function toTaskView(receipt: TaskReceipt, task?: ActiveTask): TaskView {
 /** Formats a task view as a tool result. */
 function taskResult(view: TaskView): AgentToolResult<TaskView> {
 	const lines = [
-		`Task ${view.taskId}: ${view.status}`,
+		`Task ${view.taskId}: ${view.status} (round ${view.round})`,
 		view.sessionId === "" ? undefined : `WorkBuddy session: ${view.sessionId}`,
 		view.progress === "" ? undefined : `Progress: ${view.progress}`,
 		view.error === null ? undefined : `Error: ${view.error.code} — ${view.error.message}`,
@@ -1723,7 +2466,7 @@ function taskResult(view: TaskView): AgentToolResult<TaskView> {
 		view.summary.trim() === "" ? undefined : `\n${view.summary.trim()}`,
 		view.artifacts.length === 0
 			? undefined
-			: `\nArtifacts:\n${view.artifacts.map((artifact) => `- ${artifact}`).join("\n")}`,
+			: `\nArtifacts:\n${view.artifacts.map((a) => `- ${a.path} (${a.role}${a.sha256 ? `, sha256: ${a.sha256.slice(0, 8)}...` : ""})`).join("\n")}`,
 	];
 	return {
 		content: [{ type: "text", text: lines.filter((line): line is string => line !== undefined).join("\n") }],

@@ -1,146 +1,168 @@
-# omp-workbuddy-bridge
+# omp-wb-bridge
 
-An OMP-native extension that delegates one self-contained task at a time —
-research, office documents, design — to a **WorkBuddy desktop session**, and
-brings back the real reply plus the files it produced.
+[English](README.md) | [中文](README.zh-CN.md)
 
-OMP stays the orchestrator. WorkBuddy stays the specialist executor, using its
-own native skills, plugins and permissions. Nothing is faked in between: the
-extension attaches to a live WorkBuddy ACP session over HTTP, sends a task
-brief, streams the session's events, and collects the deliverables that landed
-on disk.
+`omp-wb-bridge` is an OMP-native extension that links OMP to a WorkBuddy desktop session.
 
-## What it registers
+The division of labour is straightforward: repository code editing, refactoring, and terminal builds stay in OMP; authoring Word documents, generating slide decks, crunching spreadsheets, and producing marketing visuals or video storyboards run in WorkBuddy. Work started directly by humans inside WorkBuddy can also be synchronized back to OMP for direct inspection and integration.
 
-| Registration | Purpose |
-| --- | --- |
-| `/wb bind` | Attach this project to one WorkBuddy session, chosen explicitly from verified candidates. |
-| `/wb status` | Show the binding, whether its worker is live, and the tasks this OMP session owns. |
-| `wb_task` | Delegate a task. Returns a `taskId` immediately; the turn keeps running. |
-| `wb_status` | Read a task's status, reply text and artifact paths; optionally wait briefly for a change. |
-| `wb_cancel` | Cancel one task this OMP process owns. Never touches the worker or other sessions. |
-| `wb_tasks` | List this project's persisted tasks, newest first, with status filtering and paging. Read-only. |
-| `wb_doctor` | Diagnose the binding, task lock and bound worker without changing anything. Read-only. |
+Both sides share a local project directory and three stdio-based MCP tools. No background daemon processes, no secondary planners, and no proprietary memory systems.
 
-Alongside the tools, the package ships a `workbuddy-delegate` skill
-(`skills/workbuddy-delegate/SKILL.md`) describing the delegation workflow and
-`skills/workbuddy-delegate/references/live-smoke.md` for maintainer acceptance.
-The skill is discovered when the **package directory** is loaded:
+---
 
-```bash
-omp --cwd /path/to/your/project --no-extensions -e /path/to/omp-workbuddy-bridge
-```
+## Commands & Tools
 
-Loading the file entrypoint (`…/src/index.ts`) registers the same tools but has no
-sibling `skills/` directory to scan, so this skill is not discovered in that mode.
+### 1. Terminal Management Commands (`/wb`)
 
-## How a task flows
+| Command | Purpose |
+|---|---|
+| `/wb bind` | Pick and bind the current project to a dedicated WorkBuddy desktop session. |
+| `/wb status` | Show the bound session, worker health, and tasks currently active in this process. |
+| `/wb send <requestId>` | Confirm and submit a frozen task draft (for headless CLI sessions). |
+| `/wb release <workId>` | Explicitly unlock an orphaned or blocked file scope. |
+| `/wb setup` | Safely configure MCP connection entries in `.omp/mcp.json` and `~/.workbuddy/mcp.json`, and deploy the collaboration skill. |
+
+### 2. OMP Host Tools
+
+| Tool | Purpose |
+|---|---|
+| `wb_task` | Submit a delegation round with an `objective` and concrete `acceptance` criteria. Prompts for human confirmation before dispatch; external side-effects (e.g. emails, cloud writes, deployments) trigger a separate point-of-risk confirmation. |
+| `wb_status` | Poll execution progress, accumulated round text, and verified artifact files (with file types, byte sizes, and SHA-256 hashes). |
+| `wb_cancel` | Cancel an active task owned by this process. Waits for the worker to report turn completion before closing the socket to prevent queued deadlocks. |
+| `wb_tasks` | Paginated listing of persisted delegation records, newest first. Strictly read-only. |
+| `wb_doctor` | Read-only inspection of the binding, local file lock, and worker health endpoints without touching any files. |
+
+### 3. Shared MCP Tools (`src/mcp.ts`)
+
+Ran via standard stdio (`bun src/mcp.ts --project <root> --agent <omp|workbuddy>`):
+
+| MCP Tool | Purpose |
+|---|---|
+| `project_context` | Inspect active work items, claimed scopes, current milestones, and review verdicts across both agents. |
+| `work_claim` | Declare read/write path scopes before modifying business files to prevent concurrent write collisions. |
+| `work_publish` | Record milestones, published deliverables, or submit review opinions (with artifact hash verification). |
+
+### 4. Packaged Skills
+
+- **`skills/omp-wb-collaboration/SKILL.md`**: Common collaboration rules for both agents (inspect before claiming, claim before editing, hash deliverables, release upon completion).
+- **`skills/workbuddy-delegate/SKILL.md`**: Guide for OMP on evaluating division of labour and formulating testable acceptance conditions.
+- **`skills/workbuddy-delegate/references/native-capabilities.md`**: Concrete inputs and minimum acceptance criteria across 19 specialized native domains (reports, slide decks, posters, prototypes, scheduled tasks, etc.).
+- **Automatic Discovery**: Implements OMP's `resources_discover` hook so both skills are discovered whether loading via package directory or via `-e src/index.ts`.
+
+---
+
+## Collaboration & Execution Flow
 
 ```mermaid
 sequenceDiagram
-    participant OMP
-    participant Ext as omp-workbuddy-bridge
-    participant WB as WorkBuddy session
-    OMP->>Ext: wb_task(prompt, inputFiles, expectedOutputs)
-    Ext->>Ext: verify project binding
-    Ext->>Ext: snapshot inputs, write brief.md, take the task lock
-    Ext->>WB: ACP initialize + session/resume
-    Ext->>WB: session/prompt(brief path)
-    WB-->>Ext: agent_message_chunk / tool_call updates
-    Ext-->>OMP: taskId (status: running)
-    WB->>WB: writes deliverables into the task outputs directory
-    Ext->>Ext: collect outputs, write terminal receipt, release lock
-    OMP->>Ext: wb_status(taskId)
-    Ext-->>OMP: status, reply text, absolute artifact paths
+    autonumber
+    participant User as Human User / OMP UI
+    participant OMP as OMP (src/index.ts)
+    participant Tasks as Task Store (tasks.ts)
+    participant Collab as Collab Store (collaboration.ts)
+    participant MCP as MCP stdio (src/mcp.ts)
+    participant WB as WorkBuddy Desktop
+
+    Note over User, OMP: 1. Formulation & Confirmation
+    OMP->>OMP: Hash input snapshots and freeze draft slot
+    OMP->>User: Selection dialog (Submit this round / Keep in OMP / Cancel)
+    User-->>OMP: "Submit this round" (or /wb send <requestId>)
+    opt Contains external actions (publish/deploy/cloud_write)
+        OMP->>User: Explicit confirmation dialog for external actions
+        User-->>OMP: Approve one-time execution
+    end
+
+    Note over OMP, Collab: 2. Setup & Scope Reservation
+    OMP->>Tasks: prepareTask (validate binding, write brief.md and v2 receipt)
+    OMP->>Collab: claimWork (reserve input read scope and round outputs write scope)
+    Collab-->>OMP: Confirm no collision (overlap aborts with failed receipt)
+
+    Note over OMP, WB: 3. Execution & Checkpoint Synchronization
+    OMP->>WB: Connect ACP and stream full intent text
+    loop During execution
+        WB->>MCP: work_publish (report phase milestones and outputs)
+        OMP->>MCP: project_context (pull minimal summaries on demand)
+    end
+    WB-->>OMP: end_turn (stop reason and message reply)
+
+    Note over OMP, Collab: 4. Artifact Validation & Terminal Commit
+    OMP->>Tasks: collectArtifacts (scan round outputs, compute SHA-256 and bytes)
+    OMP->>Tasks: writeTask (commit terminal receipt with rounds[] array)
+    OMP->>Collab: releaseWork (release scope on clean completion; mark blocked on failure)
+    OMP->>Tasks: releaseTask (unlink active.lock)
+
+    Note over User, WB: 5. Consumer Inspection & Review
+    OMP->>OMP: Open files with native tools, verify against acceptance criteria
+    OMP->>MCP: work_publish (record hash-bound review: accepted / changes_requested)
 ```
 
-A task only counts as `completed` when WorkBuddy stops with `end_turn` **and**
-every declared `expectedOutputs` file exists. Anything else is reported honestly:
-`WB_OUTPUT_MISSING`, `WB_TASK_FAILED`, or `WB_INTERRUPTED`.
+---
 
-## Layout it creates
+## Directory Layout
 
-Everything lives under the project, never in your source tree:
+All generated runtime files remain inside `.wb-bridge/` in the project root:
 
 ```text
 .wb-bridge/
-  binding.json                    the chosen WorkBuddy session
-  active.lock                     one task at a time, per project
+  binding.json                      Bound WorkBuddy session identity (version 1)
+  active.lock                       Single-task project lock (one active delegated run at a time)
+  collaboration.lock                Short metadata lock held only during atomic record updates
+  collaboration/
+    <workId>.json                   Collaborative work records across OMP and WorkBuddy
   tasks/<taskId>/
-    brief.md                      the instruction handed to WorkBuddy
-    inputs/                       snapshot of the caller's input files
-    outputs/                      where WorkBuddy must write deliverables
-    receipt.json                  durable task record
+    receipt.json                    v2 task receipt containing sequential rounds[] array
+    rounds/<roundNumber>/
+      brief.md                      Rendered instruction brief for this round
+      inputs/                       Input file snapshots provided for this round
+      outputs/                      Deliverables produced by WorkBuddy for this round
+  workbuddy/<workId>/
+    outputs/                        Outputs directory allocated for WorkBuddy native tasks
 ```
 
-## Requirements
+---
 
-- **Bun** 1.4+ and a WorkBuddy desktop installation.
-- A WorkBuddy session **dedicated to OMP delegation**, created and authorized in
-  the desktop app for the same folder OMP runs in. The extension attaches to that
-  session; it never creates sessions, never spawns a CLI, and never picks a
-  session for you.
-- WorkBuddy must expose ACP for that session. If the desktop app is actively
-  driving the session, attachment is reported as `WB_BUSY` and can be retried
-  once the app lets go.
+## Safety Guarantees
 
-## Install
+1. **Human Confirmation Before Submission**:
+   - Model tools cannot self-authorize. Parameters like `approved: true` or natural-language claims of consent are ignored.
+   - If inputs are modified concurrently while a draft is frozen, SHA-256 mismatch aborts the dispatch and requests re-confirmation.
+   - Actions touching external networks, cloud resources, or cron schedules require separate dialog authorization.
+2. **Fail-Closed Permission Model**:
+   - WorkBuddy permission prompts require an explicit human **Approve once** choice. Dismissing, timeouts, or headless runs deny automatically.
+3. **Tree-Level Scope Isolation**:
+   - Programmatic path checks prevent concurrent write collisions. Overlapping writes or write-over-read abort immediately with `WB_SCOPE_CONFLICT`.
+4. **Real File & Hash Verification**:
+   - `completed` means the turn finished and files exist on disk; it does not indicate the content is correct.
+   - Reviews require verifying actual SHA-256 hashes of deliverables. Modifying a file after publication throws `WB_ARTIFACT_CHANGED`.
+5. **Configuration Protection (`/wb setup`)**:
+   - When updating `.omp/mcp.json` or `~/.workbuddy/mcp.json`, only `ENOENT` allows creating a fresh configuration.
+   - Syntax errors, non-object roots, or conflicting foreign entries halt with an error, leaving files byte-identical without overwriting unrelated tools.
+6. **Zero Credential Persistence**:
+   - Session tokens, loopback ports, model internal thoughts (`agent_thought_chunk`), and raw conversation logs are never written to disk.
 
+---
+
+## Development & Testing
+
+### Prerequisites
+- **Bun 1.4+**
+- Local WorkBuddy desktop application (version 5.8.2+) with ACP enabled.
+
+### Test Commands
 ```bash
 bun install
 bun test
 bun run typecheck
 ```
 
-Then load it explicitly in OMP:
+- `bun test`: Runs 185+ offline behavioral tests covering multi-round storage, lock contention, HTTP/SSE transport, permission gates, and dual-client MCP interaction.
+- `bun run typecheck`: Strict `tsc --noEmit` check with zero diagnostics.
 
+### Loading Extension into OMP
 ```bash
-omp --cwd /path/to/your/project -e /path/to/omp-workbuddy-bridge/src/index.ts
+# Recommended: load from package directory for full skill discovery
+omp --cwd /path/to/your/project -e /path/to/omp-wb-bridge
+
+# Configure local MCP integration in this project
+/wb setup
 ```
-
-To load it every session, add the entry point to the `extensions` array in your
-OMP config.
-
-## Safety properties
-
-- Only loopback `http://127.0.0.1:<port>` endpoints without embedded credentials
-  are ever contacted.
-- A permission request is **never** auto-approved. Only an explicit one-time
-  human choice returns `allow`; dismissing the dialog, a headless session, an
-  aborted task, or an unrendorable request all fail closed, and no standing
-  allowance is ever offered. If the task stops while a dialog is open, a late
-  "Approve once" is refused.
-- No secrets, environment values, chat history or model reasoning are written to
-  disk; the connection id and session token live in memory only.
-- Cancelling or shutting down touches one task's connection, never the WorkBuddy
-  process, its session, or another session.
-- Task inputs are restricted to real files inside the project; outputs are
-  restricted to the task's own `outputs/` directory.
-- A task's terminal receipt is committed **before** its lock is released. If
-  either the receipt write or the release fails, the task reports
-  `WB_STORAGE_ERROR` alongside the worker's own outcome, the lock is left in
-  place rather than freed on an unproven write, and the failure is never disguised
-  as a success. Fix the storage problem, then restart OMP; the next delegation
-  safely reclaims an orphaned slot after recording it as interrupted.
-- `wb_tasks` and `wb_doctor` never write: they read the stored index and the
-  binding, and contact a worker only through its three documented GET endpoints.
-  Neither one creates a directory, repairs or deletes a lock, changes the binding,
-  or requests an approval. `wb_doctor` cannot prove ACP compatibility — that is
-  only ever proven when a real delegation connects. Endpoints it cannot identify
-  are summarised in one finding rather than one warning per socket, so unrelated
-  WorkBuddy services cannot bury the real result.
-
-## Versioning and releases
-
-- **Semantic versioning:** The package adheres to SemVer. Backward-compatible bug fixes increment the patch version; backward-compatible additions of tools, optional parameters, or fields increment the minor version; breaking changes that remove or rename user-facing tools, parameters, or fields or alter behavior requiring caller migration increment the major version. Bumping version is determined by external behavior, not file counts or commit categories.
-- **Branch and commit conventions:** The `main` branch is kept runnable. Short-lived working branches use `feat/<topic>`, `fix/<topic>`, or `chore/<topic>`. Commits follow conventional format `type(scope): summary` (with optional scope), where type is `feat`, `fix`, `docs`, `test`, `refactor`, or `chore`, scoped to small, independently revertible units.
-- **Release workflow:**
-  1. Complete and verify changes locally.
-  2. Update `version` in `package.json` and the corresponding section and date in `CHANGELOG.md`.
-  3. Verify runtime and types: `bun test` and `bun run typecheck`.
-  4. If native or lifecycle behavior has changed, execute human acceptance testing following the live-smoke runbook in `skills/workbuddy-delegate/references/live-smoke.md`.
-  5. Review and commit changes.
-  6. Create a unique annotated git tag: `git tag -a v<package-version> -m "omp-workbuddy-bridge <package-version>"`.
-  7. Push `main` and the annotated tag to the remote repository. Tags are never reused, moved, or force-pushed.
-- **Runtime metadata:** Version metadata is read from `package.json` at module load time. When upgrading, start a new OMP session once active delegations are completed to load the new version.
-- **Separation of concerns:** The package product version, ACP protocol version, filesystem storage schema, and WorkBuddy desktop version are maintained independently. Public source publication preserves `"private": true`; there is no automated npm publishing, CI pipeline, or GitHub Release artifact workflow configured.

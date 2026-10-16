@@ -8,14 +8,32 @@
  * approved that one request.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import activate, { type BridgeOverrides } from "../src/index";
-import type { DesktopCallbacks, DesktopSession, PromptOutcome, TaskReceipt } from "../src/types";
+import { currentRound } from "../src/tasks";
+import type {
+	DesktopCallbacks,
+	DesktopSession,
+	FileArtifact,
+	PromptOutcome,
+	TaskError,
+	TaskReceipt,
+	TaskStatus,
+} from "../src/types";
 import { WB_ERROR_CODE } from "../src/types";
 
+export type LegacyTestReceipt = TaskReceipt & {
+	status: TaskStatus;
+	summary: string;
+	error: TaskError | null;
+	artifacts: string[];
+	prompt: string;
+	inputFiles: string[];
+	expectedOutputs: string[];
+};
 const TASK_ID = "11111111-2222-4333-8444-555555555555";
 const SESSION_ID = "66666666-7777-4888-8999-aaaaaaaaaaaa";
 
@@ -58,8 +76,9 @@ class MockWbTaskError extends Error {
 class Harness {
 	readonly tools = new Map<string, RegisteredTool>();
 	readonly captured: CapturedSession[] = [];
-	readonly written = new Map<string, TaskReceipt>();
+	readonly written = new Map<string, LegacyTestReceipt>();
 	readonly released: string[] = [];
+	readonly commands = new Map<string, { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
 	artifacts: string[] = [];
 	missingOutputs: string[] = [];
 	outcome: PromptOutcome = { stopReason: "end_turn" };
@@ -85,8 +104,7 @@ class Harness {
 	cancelCalls = 0;
 	closeCalls = 0;
 	/** Stored task rows the index reports, as a real project directory would. */
-	readonly storedIndex: Array<{ taskId: string; sessionId: string; status: TaskReceipt["status"]; updatedAt: number }> = [];
-	/** Unreadable stored records the index reports alongside the readable ones. */
+	readonly storedIndex: Array<{ taskId: string; sessionId: string; round: number; status: TaskStatus; updatedAt: number }> = [];
 	readonly storedWarnings: Array<{ taskId: string; error: { code: string; message: string } }> = [];
 	/** Overrides the binding `wb_doctor` and the tools read; null means "no binding". */
 	readBindingResult: { version: 1; projectRoot: string; sessionId: string; workbuddyVersion: string } | null = {
@@ -121,6 +139,19 @@ class Harness {
 		| { promise: Promise<PromptOutcome>; resolve(value: PromptOutcome): void; reject(error: Error): void }
 		| undefined;
 	private shutdown: (() => Promise<void>) | undefined;
+	private updateResolvers: Array<() => void> = [];
+	notifyUpdate(): void {
+		const list = this.updateResolvers;
+		this.updateResolvers = [];
+		for (const r of list) {
+			r();
+		}
+	}
+	async waitForUpdate(): Promise<void> {
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.updateResolvers.push(resolve);
+		await promise;
+	}
 
 	/**
 	 * Holds the next turn open until {@link releaseTurn} or {@link failTurn}.
@@ -203,23 +234,52 @@ class Harness {
 				this.captured.push({ binding, callbacks, session });
 				return session;
 			},
-			prepareTask: async (binding, request) => {
+			prepareTask: async (binding, request, confirmation) => {
+				const roundNumber = request.taskId ? 2 : 1;
 				const receipt: TaskReceipt = {
-					version: 1,
+					version: 2,
 					taskId: request.taskId ?? TASK_ID,
 					sessionId: binding.sessionId,
 					projectRoot: binding.projectRoot,
-					status: "running",
-					prompt: request.prompt,
-					inputFiles: request.inputFiles ?? [],
-					expectedOutputs: request.expectedOutputs ?? [],
-					summary: "",
-					artifacts: [],
-					error: null,
+					rounds: [
+						{
+							number: roundNumber,
+							layout: "round",
+							goal: request.goal ?? {
+								objective: "test prompt",
+								context: "",
+								constraints: [],
+								acceptance: ["done"],
+								externalActions: [],
+							},
+							inputFiles: (request.inputFiles ?? []).map((p) => ({ path: p, sha256: "fake" })),
+							expectedOutputs: request.expectedOutputs ?? [],
+							status: "running",
+							summary: "",
+							error: null,
+							artifacts: [],
+							consent: {
+								source: confirmation?.source ?? "host_dialog",
+								at: confirmation?.at ?? new Date().toISOString(),
+							},
+						},
+					],
 				};
-				this.written.set(receipt.taskId, { ...receipt });
+				const current = currentRound(receipt);
+				const stored = {
+					...receipt,
+					get status() { return current.status; },
+					get summary() { return current.summary; },
+					get error() { return current.error; },
+					get artifacts() { return current.artifacts.map((a) => a.path); },
+					get prompt() { return current.goal.objective; },
+					get inputFiles() { return current.inputFiles.map((i) => i.path); },
+					get expectedOutputs() { return current.expectedOutputs; },
+				} as unknown as LegacyTestReceipt;
+				this.written.set(receipt.taskId, stored);
 				return {
 					receipt,
+					round: roundNumber,
 					briefPath: `${binding.projectRoot}/.wb-bridge/tasks/${receipt.taskId}/brief.md`,
 					outputsDir: `${binding.projectRoot}/.wb-bridge/tasks/${receipt.taskId}/outputs`,
 				};
@@ -240,6 +300,45 @@ class Harness {
 				const receipt = this.written.get(taskId);
 				if (receipt === undefined) {
 					throw new MockWbTaskError("WB_TASK_NOT_FOUND", `no task ${taskId}`);
+				}
+				const unk = receipt as unknown;
+				if (typeof unk === "object" && unk !== null && "version" in unk && unk.version === 1) {
+					const r1 = unk as Record<string, unknown>;
+					const v2Receipt: TaskReceipt = {
+						version: 2,
+						taskId: String(r1.taskId),
+						sessionId: String(r1.sessionId),
+						projectRoot: String(r1.projectRoot),
+						rounds: [
+							{
+								number: 1,
+								layout: "legacy",
+								goal: {
+									objective: typeof r1.prompt === "string" ? r1.prompt : "",
+									context: "",
+									constraints: [],
+									acceptance: ["done"],
+									externalActions: [],
+								},
+								inputFiles: (Array.isArray(r1.inputFiles) ? r1.inputFiles : []).map((p: unknown) => ({ path: String(p), sha256: null })),
+								expectedOutputs: Array.isArray(r1.expectedOutputs) ? r1.expectedOutputs.map(String) : [],
+								status: (typeof r1.status === "string" ? r1.status : "completed") as TaskReceipt["rounds"][number]["status"],
+								summary: typeof r1.summary === "string" ? r1.summary : "",
+								error: (typeof r1.error === "object" && r1.error !== null ? r1.error : null) as TaskReceipt["rounds"][number]["error"],
+								artifacts: (Array.isArray(r1.artifacts) ? r1.artifacts : []).map((p: unknown) => ({
+									kind: "file",
+									path: String(p),
+									sha256: null,
+									bytes: null,
+									role: "final",
+									provenance: "legacy_unverified",
+									importedFrom: null,
+								})),
+								consent: null,
+							},
+						],
+					};
+					return v2Receipt;
 				}
 				return { ...receipt };
 			},
@@ -265,19 +364,31 @@ class Harness {
 				}));
 			},
 			writeTask: async (receipt) => {
+				const current = currentRound(receipt);
 				const isTerminal =
-					receipt.status === "completed" ||
-					receipt.status === "cancelled" ||
-					receipt.status === "failed" ||
-					receipt.status === "interrupted";
+					current.status === "completed" ||
+					current.status === "cancelled" ||
+					current.status === "failed" ||
+					current.status === "interrupted";
 				if (isTerminal) {
-					this.events.push(`write:${receipt.status}`);
+					this.events.push(`write:${current.status}`);
 					if (this.failTerminalWrite) {
 						this.failTerminalWrite = false;
 						throw new Error("simulated disk failure");
 					}
 				}
-				this.written.set(receipt.taskId, { ...receipt });
+				const stored = {
+					...receipt,
+					get status() { return current.status; },
+					get summary() { return current.summary; },
+					get error() { return current.error; },
+					get artifacts() { return current.artifacts.map((a) => a.path); },
+					get prompt() { return current.goal.objective; },
+					get inputFiles() { return current.inputFiles.map((i) => i.path); },
+					get expectedOutputs() { return current.expectedOutputs; },
+				} as unknown as LegacyTestReceipt;
+				this.written.set(receipt.taskId, stored);
+				this.notifyUpdate();
 				// In a real project the receipt *is* the row the index reports, so a
 				// committed write is visible to a later listing.
 				const row = this.storedIndex.find((entry) => entry.taskId === receipt.taskId);
@@ -285,12 +396,14 @@ class Harness {
 					this.storedIndex.push({
 						taskId: receipt.taskId,
 						sessionId: receipt.sessionId,
-						status: receipt.status,
+						round: current.number,
+						status: current.status,
 						updatedAt: Date.now(),
 					});
 				} else {
-					row.status = receipt.status;
+					row.status = current.status;
 					row.sessionId = receipt.sessionId;
+					row.round = current.number;
 					row.updatedAt = Date.now();
 				}
 			},
@@ -303,7 +416,16 @@ class Harness {
 				if (gate !== undefined) {
 					await gate.promise;
 				}
-				return { artifacts: this.artifacts, missingOutputs: this.missingOutputs };
+				const fileArtifacts: FileArtifact[] = this.artifacts.map((a) => ({
+					kind: "file",
+					path: a,
+					sha256: "fake-sha",
+					bytes: 100,
+					role: "final",
+					provenance: "native",
+					importedFrom: null,
+				}));
+				return { artifacts: fileArtifacts, missingOutputs: this.missingOutputs };
 			},
 			releaseTask: async (_projectRoot, taskId) => {
 				this.events.push("release");
@@ -311,6 +433,7 @@ class Harness {
 					throw new Error("simulated lock release failure");
 				}
 				this.released.push(taskId);
+				this.notifyUpdate();
 			},
 			// A real cancellation holds the connection for seconds; tests that hold a
 			// turn open would spend that budget on every case, so it is shortened
@@ -318,13 +441,14 @@ class Harness {
 			cancelSettleMs: this.cancelSettleMs,
 		};
 
-		const chain = { describe: () => chain, optional: () => chain };
+		const chain = { describe: () => chain, optional: () => chain, default: () => chain, min: () => chain, strict: () => chain };
 		const api = {
 			zod: {
-				object: (shape: unknown) => shape,
+				object: (shape: unknown) => ({ ...(typeof shape === "object" && shape !== null ? shape : {}), describe: () => chain, optional: () => chain, strict: () => chain }),
 				string: () => chain,
 				number: () => chain,
 				array: () => chain,
+				enum: () => chain,
 			},
 			logger: { debug: () => undefined, info: () => undefined, warn: () => undefined, error: () => undefined },
 			on: (event: string, handler: () => Promise<void>) => {
@@ -332,7 +456,11 @@ class Harness {
 					this.shutdown = handler;
 				}
 			},
-			registerCommand: () => undefined,
+			registerCommand: (name: string, command: unknown) => {
+				if (typeof command === "object" && command !== null && "handler" in command) {
+					this.commands.set(name, command as { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> });
+				}
+			},
 			registerTool: (tool: RegisteredTool) => {
 				this.tools.set(tool.name, tool);
 			},
@@ -345,6 +473,12 @@ class Harness {
 	async shutdownExtension(): Promise<void> {
 		await this.shutdown?.();
 	}
+	async callCommand(name: string, args: string, ctx: ExtensionCommandContext): Promise<void> {
+		const cmd = this.commands.get(name);
+		if (cmd) {
+			await cmd.handler(args, ctx);
+		}
+	}
 
 	/** Invokes a registered tool with the arguments the tests care about. */
 	async call(name: string, params: unknown, ctx: ExtensionContext): Promise<AgentToolResult<unknown>> {
@@ -352,7 +486,25 @@ class Harness {
 		if (tool === undefined) {
 			throw new Error(`tool ${name} was not registered`);
 		}
-		return await tool.execute("tool-call", params as never, undefined, undefined, ctx);
+		let callParams = params;
+		if (name === "wb_task" && params && typeof params === "object") {
+			const p = params as Record<string, unknown>;
+			if ("prompt" in p && !("goal" in p)) {
+				callParams = {
+					goal: {
+						objective: p.prompt,
+						context: "",
+						constraints: [],
+						acceptance: ["done"],
+						externalActions: [],
+					},
+					inputFiles: p.inputFiles,
+					expectedOutputs: p.expectedOutputs,
+					taskId: p.taskId,
+				};
+			}
+		}
+		return await tool.execute("tool-call", callParams as never, undefined, undefined, ctx);
 	}
 
 	lastSession(): CapturedSession {
@@ -369,13 +521,14 @@ class Harness {
 	 * The receipt is written before the task's lock is released, so this waits for
 	 * both: the terminal record and the freed slot.
 	 */
-	async waitForStatus(taskId: string, status: TaskReceipt["status"]): Promise<TaskReceipt | undefined> {
-		for (let attempt = 0; attempt < 200; attempt += 1) {
+	async waitForStatus(taskId: string, status: TaskStatus): Promise<LegacyTestReceipt | undefined> {
+		for (let attempt = 0; attempt < 100; attempt += 1) {
 			const receipt = this.written.get(taskId);
-			if (receipt?.status === status && this.released.includes(taskId)) {
+			const current = receipt ? currentRound(receipt) : undefined;
+			if (current?.status === status && this.released.includes(taskId)) {
 				return receipt;
 			}
-			await Promise.resolve();
+			await this.waitForUpdate();
 		}
 		return this.written.get(taskId);
 	}
@@ -397,7 +550,11 @@ interface RegisteredTool {
 interface UiHarness {
 	ctx: ExtensionContext;
 	choices: string[];
+	targetChoices: string[];
+	targetDecision?: string;
+	setTargetDecision(d: string): void;
 	statuses: Array<string | undefined>;
+	notifications: Array<{ message: string; type?: string }>;
 	/** Signals passed to each dialog, so abort wiring can be asserted. */
 	dialogSignals: AbortSignal[];
 	/**
@@ -422,7 +579,10 @@ interface UiHarness {
 
 function makeContext(options: { hasUI?: boolean; cwd?: string } = {}): UiHarness {
 	const choices: string[] = [];
+	const targetChoices: string[] = [];
+	let targetDecision: string | undefined;
 	const statuses: Array<string | undefined> = [];
+	const notifications: Array<{ message: string; type?: string }> = [];
 	const dialogSignals: AbortSignal[] = [];
 	let answer: string | undefined;
 	let held = false;
@@ -435,9 +595,11 @@ function makeContext(options: { hasUI?: boolean; cwd?: string } = {}): UiHarness
 			offered: string[],
 			dialogOptions?: { signal?: AbortSignal },
 		): Promise<string | undefined> => {
+			if (offered.includes("Submit this round")) {
+				targetChoices.push(...offered);
+				return targetDecision ?? "Submit this round";
+			}
 			choices.push(...offered);
-			// Each dialog parks on its own resolver, so several can be open at once
-			// and be released independently.
 			let release!: () => void;
 			const parkedPromise = new Promise<void>((resolve) => {
 				release = resolve;
@@ -471,16 +633,25 @@ function makeContext(options: { hasUI?: boolean; cwd?: string } = {}): UiHarness
 			return answer;
 		},
 		confirm: async () => true,
-		notify: () => undefined,
+		notify: (message: string, type?: string) => {
+			notifications.push({ message, type });
+		},
 		setStatus: (_key: string, text: string | undefined) => {
 			statuses.push(text);
+			harness.notifyUpdate();
 		},
 	};
 	const ctx = { cwd: options.cwd ?? PROJECT_ROOT, hasUI: options.hasUI ?? true, ui };
 	return {
 		ctx: ctx as unknown as ExtensionContext,
 		choices,
+		targetChoices,
+		targetDecision,
+		setTargetDecision: (d: string) => {
+			targetDecision = d;
+		},
 		statuses,
+		notifications,
 		dialogSignals,
 		get answerDespiteAbort() {
 			return answerDespiteAbort;
@@ -608,14 +779,14 @@ async function pollUntil(
 	h: UiHarness,
 	taskId: string,
 	check: (view: ResultView) => boolean,
-	attempts = 200,
+	attempts = 100,
 ): Promise<ResultView> {
 	for (let attempt = 0; attempt < attempts; attempt += 1) {
 		const view = detailsOf(await harness.call("wb_status", { taskId, waitMs: 0 }, h.ctx));
 		if (check(view)) {
 			return view;
 		}
-		await Promise.resolve();
+		await harness.waitForUpdate();
 	}
 	throw new Error(`condition was never satisfied for task ${taskId}`);
 }
@@ -807,7 +978,10 @@ describe("approval - no grant without an explicit human decision", () => {
 		const h = makeContext({ hasUI: false });
 		h.setAnswer("Approve once");
 		harness.start();
-		await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
+		const result = await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
+		expect(result.details).toHaveProperty("requestId");
+		const requestId = (result.details as { requestId: string }).requestId;
+		await harness.callCommand("wb", `send ${requestId}`, h.ctx as unknown as ExtensionCommandContext);
 
 		const answer = await harness.lastSession().callbacks.onRequest(
 			"codebuddy.ai/interruptionRequest",
@@ -1279,7 +1453,7 @@ describe("approval - terminal states and receipts", () => {
 			summary: "earlier reply",
 			artifacts: ["/project/.wb-bridge/tasks/t/outputs/report.md"],
 			error: null,
-		});
+		} as unknown as LegacyTestReceipt);
 
 		const status = await harness.call("wb_status", { taskId: TASK_ID, waitMs: 0 }, h.ctx);
 		expect(status.isError).toBe(false);
@@ -1307,7 +1481,7 @@ describe("approval - terminal states and receipts", () => {
 			summary: "",
 			artifacts: [],
 			error: null,
-		});
+		} as unknown as LegacyTestReceipt);
 
 		const cancel = await harness.call("wb_cancel", { taskId: TASK_ID }, h.ctx);
 		expect(cancel.isError).toBe(true);
@@ -1339,7 +1513,6 @@ describe("terminal commit ordering and storage failures", () => {
 		await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
 		harness.releaseTurn();
 		await harness.waitForStatus(TASK_ID, "completed");
-
 		const terminalWrite = harness.events.indexOf("write:completed");
 		const release = harness.events.indexOf("release");
 		expect(terminalWrite).toBeGreaterThanOrEqual(0);
@@ -1741,12 +1914,12 @@ describe("terminal commit ordering and storage failures", () => {
 describe("wb_tasks history listing", () => {
 	/** Seeds one stored row the index will report. */
 	function seed(
-		list: Array<{ taskId: string; sessionId: string; status: TaskReceipt["status"]; updatedAt: number }>,
+		list: Array<{ taskId: string; sessionId: string; round: number; status: TaskStatus; updatedAt: number }>,
 		taskId: string,
-		status: TaskReceipt["status"],
+		status: TaskStatus,
 		updatedAt: number,
 	): void {
-		list.push({ taskId, sessionId: SESSION_ID, status, updatedAt });
+		list.push({ taskId, sessionId: SESSION_ID, round: 1, status, updatedAt });
 	}
 
 	it("pages newest first with a task-id tie-break and reports nextOffset", async () => {
@@ -2061,7 +2234,7 @@ describe("wb_doctor read-only diagnosis", () => {
 			summary: "ok",
 			artifacts: [],
 			error: null,
-		});
+		} as unknown as LegacyTestReceipt);
 
 		const before = JSON.stringify([...harness.written.entries()]);
 		const releasedBefore = [...harness.released];
@@ -2236,5 +2409,70 @@ describe("cancellation waits for the worker's turn to end", () => {
 		const after = await harness.call("wb_cancel", { taskId }, h.ctx);
 		expect(Date.now() - before).toBeLessThan(1_000);
 		expect(detailsOf(after).status).toBe("completed");
+	});
+});
+
+describe("/wb setup configuration safety", () => {
+	it("refuses to overwrite malformed JSON in .omp/mcp.json and leaves it byte-identical", async () => {
+		const h = makeContext();
+		harness.start();
+
+		const ompMcpDir = path.join(PROJECT_ROOT, ".omp");
+		await mkdir(ompMcpDir, { recursive: true });
+		const ompMcpPath = path.join(ompMcpDir, "mcp.json");
+		const malformedContent = "{ invalid json content, broken syntax";
+		await writeFile(ompMcpPath, malformedContent, "utf-8");
+
+		h.setAnswer("Apply MCP configuration");
+		await harness.callCommand("wb", "setup", h.ctx as unknown as ExtensionCommandContext);
+
+		expect(h.notifications.some((n) => n.type === "error" && n.message.includes("Invalid JSON"))).toBe(true);
+		const contentAfter = await readFile(ompMcpPath, "utf-8");
+		expect(contentAfter).toBe(malformedContent);
+	});
+
+	it("refuses to overwrite non-object root or non-object mcpServers and leaves it byte-identical", async () => {
+		const h = makeContext();
+		harness.start();
+
+		const ompMcpDir = path.join(PROJECT_ROOT, ".omp");
+		await mkdir(ompMcpDir, { recursive: true });
+		const ompMcpPath = path.join(ompMcpDir, "mcp.json");
+		const arrayContent = JSON.stringify(["not", "an", "object"]);
+		await writeFile(ompMcpPath, arrayContent, "utf-8");
+
+		h.setAnswer("Apply MCP configuration");
+		await harness.callCommand("wb", "setup", h.ctx as unknown as ExtensionCommandContext);
+
+		expect(h.notifications.some((n) => n.type === "error" && n.message.includes("root must be a JSON object"))).toBe(true);
+		expect(await readFile(ompMcpPath, "utf-8")).toBe(arrayContent);
+	});
+
+	it("refuses to overwrite a foreign conflicting omp-wb-bridge entry", async () => {
+		const h = makeContext();
+		harness.start();
+
+		const ompMcpDir = path.join(PROJECT_ROOT, ".omp");
+		await mkdir(ompMcpDir, { recursive: true });
+		const ompMcpPath = path.join(ompMcpDir, "mcp.json");
+		const foreignContent = JSON.stringify(
+			{
+				mcpServers: {
+					"omp-wb-bridge": {
+						command: "node",
+						args: ["/opt/foreign/server.js", "--custom"],
+					},
+				},
+			},
+			null,
+			2,
+		);
+		await writeFile(ompMcpPath, foreignContent, "utf-8");
+
+		h.setAnswer("Apply MCP configuration");
+		await harness.callCommand("wb", "setup", h.ctx as unknown as ExtensionCommandContext);
+
+		expect(h.notifications.some((n) => n.type === "error" && n.message.includes("does not match this bridge installation"))).toBe(true);
+		expect(await readFile(ompMcpPath, "utf-8")).toBe(foreignContent);
 	});
 });

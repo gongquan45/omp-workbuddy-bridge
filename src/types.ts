@@ -47,6 +47,7 @@ export interface TaskLock {
 export interface StoredTaskSummary {
 	taskId: string;
 	sessionId: string;
+	round: number;
 	status: TaskStatus;
 	/** `receipt.json` modification time in milliseconds. */
 	updatedAt: number;
@@ -67,9 +68,10 @@ export interface TaskListWarning {
 export interface TaskView {
 	taskId: string;
 	sessionId: string;
+	round: number;
 	status: TaskStatus;
 	summary: string;
-	artifacts: string[];
+	artifacts: FileArtifact[];
 	error: TaskError | null;
 	progress: string;
 	awaitingApproval: boolean;
@@ -78,24 +80,130 @@ export interface TaskView {
 	storageError: TaskError | null;
 }
 
-/** Durable record of one delegated task. */
+/** A single planned external action in a task goal. */
+export interface ExternalAction {
+	kind: "publish" | "deploy" | "cloud_write" | "schedule";
+	target: string;
+	operation: string;
+	parameters: string;
+}
+
+/** Specification of the intent and boundaries for a task round. */
+export interface TaskGoal {
+	objective: string;
+	context: string;
+	constraints: string[];
+	acceptance: string[];
+	externalActions: ExternalAction[];
+}
+
+/** Snapshot of one input file provided for a round. */
+export interface InputSnapshot {
+	path: string;
+	sha256: string | null;
+}
+
+/** Deliverable file produced or imported by a task round. */
+export interface FileArtifact {
+	kind: "file";
+	path: string;
+	sha256: string | null;
+	bytes: number | null;
+	role: "final" | "supporting";
+	provenance: "native" | "imported" | "legacy_unverified";
+	importedFrom: string | null;
+}
+
+/** One sequential round of interaction within a delegated task. */
+export interface TaskRound {
+	number: number;
+	layout: "legacy" | "round";
+	goal: TaskGoal;
+	inputFiles: InputSnapshot[];
+	expectedOutputs: string[];
+	status: TaskStatus;
+	summary: string;
+	error: TaskError | null;
+	artifacts: FileArtifact[];
+	consent: {
+		source: "host_dialog" | "user_command";
+		at: string;
+	} | null;
+}
+
+/** Durable record of one delegated task across all its execution rounds. */
 export interface TaskReceipt {
-	version: 1;
+	version: 2;
 	taskId: string;
 	sessionId: string;
 	projectRoot: string;
-	status: TaskStatus;
-	/** The instruction sent to WorkBuddy for this task. */
-	prompt: string;
-	/** Project-relative paths snapshotted into the task's `inputs/` directory. */
-	inputFiles: string[];
-	/** `outputs/`-relative filenames WorkBuddy is expected to produce. */
-	expectedOutputs: string[];
-	/** WorkBuddy's accumulated reply text. */
-	summary: string;
-	/** Absolute paths of files collected from the task's `outputs/` directory. */
-	artifacts: string[];
-	error: TaskError | null;
+	rounds: TaskRound[];
+}
+
+/** Caller-facing request to start or supplement a delegated task. */
+export interface TaskRequest {
+	goal: TaskGoal;
+	inputFiles?: string[];
+	expectedOutputs?: string[];
+	taskId?: string;
+}
+
+/** Explicit human confirmation authorizing a task round to execute. */
+export interface RoundConfirmation {
+	source: "host_dialog" | "user_command";
+	at: string;
+	sessionId: string;
+	previousRound: number;
+	inputs: { path: string; sha256: string }[];
+}
+
+/** Result of preparing a task round on disk. */
+export interface PreparedTask {
+	receipt: TaskReceipt;
+	round: number;
+	briefPath: string;
+	outputsDir: string;
+}
+
+/** Self-reported remote external action outcome. */
+export interface RemoteResult {
+	kind: "publish" | "deploy" | "cloud_write" | "schedule";
+	target: string;
+	evidence: string;
+	verification: "reported";
+}
+
+/** Structured review opinion by either OMP or WorkBuddy. */
+export interface WorkReview {
+	reviewer: "omp" | "workbuddy";
+	round: number | null;
+	artifacts: { path: string; sha256: string }[];
+	verdict: "accepted" | "changes_requested" | "unverified";
+	note: string;
+	at: string;
+}
+
+/** Durable record of a collaboration unit between OMP and WorkBuddy. */
+export interface WorkRecord {
+	version: 1;
+	workId: string;
+	projectRoot: string;
+	owner: "omp" | "workbuddy";
+	source: "native" | "delegated";
+	taskId: string | null;
+	round: number | null;
+	nativeRef: { sessionId: string; goalId: string | null } | null;
+	title: string;
+	scope: { readPaths: string[]; writePaths: string[] } | null;
+	state: "active" | "blocked" | "released";
+	phase: string;
+	milestone: string;
+	blocker: string;
+	updatedAt: string;
+	revision: number;
+	artifacts: FileArtifact[];
+	remoteResults: RemoteResult[];
+	reviews: WorkReview[];
 }
 
 /** Handlers a desktop session uses to surface agent activity and requests. */
@@ -210,6 +318,14 @@ export const WB_ERROR_CODE = {
 	taskFailed: "WB_TASK_FAILED",
 	/** The request needs an approval this client cannot faithfully obtain. */
 	approvalUnsupported: "WB_APPROVAL_UNSUPPORTED",
+	/** Explicit human consent is required before execution. */
+	consentRequired: "WB_CONSENT_REQUIRED",
+	/** A declared read or write scope conflicts with another active work record. */
+	scopeConflict: "WB_SCOPE_CONFLICT",
+	/** Target record was modified concurrently or expected revision did not match. */
+	revisionConflict: "WB_REVISION_CONFLICT",
+	/** An artifact's content hash changed since inspection or publication. */
+	artifactChanged: "WB_ARTIFACT_CHANGED",
 } as const;
 
 /** Builds a {@link TaskError} without restating the shape at each call site. */
