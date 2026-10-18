@@ -34,7 +34,7 @@
 | 2026-10-18 16:43:27 | **目录 `LastWriteTime` 定格于此** — 清空发生时刻 |
 | 2026-10-18 16:49 | 从会话 transcript 恢复出首批文件（`_recovered/`） |
 | 2026-10-18 17:20 | 当前会话 transcript 最后写入 |
-| 2026-10-18（稍后） | 发现远端完好，克隆至 `E:\Desktop\omp-wb-remote`，验证基线绿 |
+| 2026-10-18（稍后） | 发现远端完好，克隆验证基线绿（临时基线副本，已于同日清理并入 `OMP-WorkBuddy`） |
 
 事故窗口：首个包含缺陷 `afterEach` 的测试文件被创建后，到其首次在含编译错误的状态下运行之间。
 
@@ -166,8 +166,8 @@ afterEach(async () => {
 | 测试清理前要求就绪标志 + 绝对路径 + 最小长度 | `test/queue.test.ts`、`test/migration.test.ts`、`test/logging.test.ts` | ✅ 三个文件均已加入，已随文件复制到新树 |
 | `beforeEach` 成功后置位、`afterEach` 消费后复位 | 同上 | ✅ `rootReady` 标志 |
 | 产品代码拒绝空/相对根 | `src/queue.ts: canonicalProjectRoot` | ✅ 抛 `WB_INPUT_INVALID`，不再回退 `path.resolve("")` |
-| 基线副本 | `E:\Desktop\omp-wb-remote`（克隆自远端） | ✅ 已验证绿 |
-| 恢复副本 | `E:\Desktop\omp-workbuddy-recovery\tree` | ✅ 保留 |
+| 基线副本 | 临时克隆自远端 | ✅ 已验证绿（副本已清理，可由 `git clone` 复现） |
+| 恢复副本 | `_recovered/incident-2026-10-18-recovery.tar.gz` | ✅ 已归档（参考树已清理） |
 | 远端作为锚点 | `9f01805` | ✅ 存在 |
 
 ### 5.4 建议的后续措施
@@ -193,18 +193,20 @@ afterEach(async () => {
 **基线的具体验证方法**（使报告可复核，而非仅叙述）：
 
 ```sh
-cd E:/Desktop/omp-wb-remote
-git stash -q -u      # 移出全部移植文件，回到纯 9f01805
+# 克隆到任意临时目录即可复现，不依赖任何桌面路径
+git clone https://github.com/gongquan45/omp-workbuddy-bridge.git /tmp/wb-baseline
+cd /tmp/wb-baseline
+git checkout 9f01805
+bun install
 bun test             # → 185 pass / 1 skip / 0 fail（共 186 项）
 bun run typecheck    # → 0 错误
-git stash pop        # 恢复移植文件
 ```
 
 即在**移植文件不存在**的状态下测量基线，这是"基线从未受损"最直接的证据。
 
 ### 6.2 当前状态（本报告编写时）
 
-工作树：`E:\Desktop\omp-wb-remote`（克隆自远端 `9f01805`）
+工作树：`E:\Desktop\OMP-WorkBuddy`（规范工作树；临时基线副本已清理）
 
 | 指标 | 值 |
 |---|---|
@@ -256,11 +258,12 @@ git stash pop        # 恢复移植文件
 
 | 名称 | 路径 |
 |---|---|
-| 远端基线克隆 | `E:\Desktop\omp-wb-remote` |
-| 恢复工作副本 | `E:\Desktop\omp-workbuddy-recovery\tree` |
-| 文件版本库（每文件所有历史版本） | `E:\Desktop\omp-workbuddy-recovery\versions` |
+| 事故归档（含 `versions/` 52 个中间版本、`tree/`、`.scratch/` 提取脚本） | `E:\Desktop\OMP-WorkBuddy\_recovered\incident-2026-10-18-recovery.tar.gz`（192 文件，SHA-256 已比对无损；`tree/node_modules` 除外，可 `bun install` 再生） |
+| 远端基线副本 | 已清理，可按 §6.1 命令 `git clone` + `git checkout 9f01805` 复现 |
+| 恢复工作副本 | 已并入上述归档的 `tree/` |
+| 文件版本库（每文件所有历史版本） | 已并入上述归档的 `versions/` |
 | 会话 transcript | `C:\Users\FKCZ3\.omp\agent\sessions\--E--Desktop-OMP-WorkBuddy--` |
-| 需求与计划文档 | 恢复树 `docs/`（另见 `E:\Desktop\omp-wb-bridge-requirements-backup.md`） |
+| 需求与计划文档 | `E:\Desktop\OMP-WorkBuddy\omp-wb-bridge-requirements-backup.md`、`memorix-report-backup.md`（`omp-workbuddy-bridge-plan.md` 未能恢复） |
 | 被清空目录 | `E:\Desktop\OMP-WorkBuddy`（创建于 2026-10-13 18:32，最后修改 2026-10-18 16:43） |
 
 ---
