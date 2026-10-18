@@ -326,7 +326,10 @@ export async function migrateProjectToQueue(root: string): Promise<string> {
 						round = excluded.round`,
 					[
 						workId,
-						nextRevision(db),
+						// Record version from the merged object, not the project-wide
+						// audit counter: expectedRevision CAS compares against this, and
+						// the two would otherwise diverge the moment either side bumps.
+						(record.revision as number | undefined) ?? 1,
 						record.state as string,
 						JSON.stringify(record),
 						(record.taskId as string | null) ?? null,

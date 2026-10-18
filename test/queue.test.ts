@@ -682,3 +682,55 @@ async function runIsolatedClaim(script: string): Promise<ClaimOutcome> {
 		await rm(tempPath, { force: true });
 	}
 }
+
+describe("works.revision is the record version, not the audit counter", () => {
+	/** Reads the column and the serialized record version side by side. */
+	function worksVersions(workId: string): { column: number; record: number } | null {
+		const db = openWriteConnection(root);
+		const row = db.query("SELECT revision, record_json FROM works WHERE work_id = ?").get(workId) as
+			| { revision: number; record_json: string }
+			| null;
+		if (row === null) {
+			return null;
+		}
+		const record = JSON.parse(row.record_json) as { revision?: number };
+		return { column: row.revision, record: record.revision ?? -1 };
+	}
+
+	it("keeps the column and record_json in step across enqueue and claim", async () => {
+		prepareProject();
+		const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
+		const queue = openProjectQueue(root, { mode: "write" })!;
+		try {
+			queue.enqueue(input);
+			const workId = delegatedWorkId(TASK_A, 1);
+
+			const queued = worksVersions(workId);
+			expect(queued).not.toBeNull();
+			// A fresh record starts at version 1 regardless of how many other
+			// records the project has written before it.
+			expect(queued!.column).toBe(1);
+			expect(queued!.record).toBe(1);
+
+			// A second unrelated round must not inflate this record's version.
+			const other = await stageRealSnapshot({
+				taskId: TASK_B,
+				round: 1,
+				requestId: REQUEST_B,
+				inputRel: "other-input.txt",
+				targetSessionId: "wb-session-2",
+			});
+			queue.enqueue(other.input);
+			expect(worksVersions(workId)!.column).toBe(1);
+
+			// Claiming promotes the scope: a record change, so both readers advance.
+			expect(queue.claim(owner(), Date.now()).kind).toBe("claimed");
+			const afterClaim = worksVersions(workId);
+			expect(afterClaim!.column).toBe(2);
+			expect(afterClaim!.record).toBe(2);
+			expect(afterClaim!.column).toBe(afterClaim!.record);
+		} finally {
+			queue.close();
+		}
+	});
+});

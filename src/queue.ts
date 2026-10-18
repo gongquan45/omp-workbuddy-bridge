@@ -1001,7 +1001,9 @@ class WriteQueue implements ProjectQueue {
 				milestone: "",
 				blocker: "",
 				updatedAt: new Date(now).toISOString(),
-				revision,
+				// Record version, not the project-wide audit counter: this is what
+				// expectedRevision CAS compares against.
+				revision: 1,
 				artifacts: [],
 				remoteResults: [],
 				reviews: [],
@@ -1009,7 +1011,7 @@ class WriteQueue implements ProjectQueue {
 			this.db.run(
 				`INSERT INTO works(work_id, revision, state, record_json, task_id, round)
 				 VALUES(?, ?, 'waiting', ?, ?, ?)`,
-				[workRecord.workId, revision, JSON.stringify(workRecord), payloadTaskId, payloadRound],
+				[workRecord.workId, 1, JSON.stringify(workRecord), payloadTaskId, payloadRound],
 			);
 			// Persist the staged manifest's per-file rows: execution reads these
 			// snapshot paths and re-verifies the frozen digests before prompting.
@@ -1141,11 +1143,26 @@ class WriteQueue implements ProjectQueue {
 					} as ClaimOutcome;
 					continue;
 				}
-				this.db.run(
-					`UPDATE works SET state = 'active', revision = ?
-					 WHERE task_id = ? AND round = ? AND state = 'waiting'`,
-					[revision, taskId, round],
-				);
+				// Promoting the scope is a record change: bump the record version and
+				// keep record_json in step with the column, so a later
+				// expectedRevision CAS sees the same number from either reader.
+				const pendingRow = this.db
+					.query("SELECT record_json FROM works WHERE task_id = ? AND round = ?")
+					.get(taskId, round) as { record_json: string } | null;
+				if (pendingRow !== null) {
+					const pendingRecord = JSON.parse(pendingRow.record_json) as Record<string, unknown>;
+					const nextVersion = ((pendingRecord.revision as number | undefined) ?? 1) + 1;
+					this.db.run(
+						`UPDATE works SET state = 'active', revision = ?, record_json = ?
+						 WHERE task_id = ? AND round = ? AND state = 'waiting'`,
+						[
+							nextVersion,
+							JSON.stringify({ ...pendingRecord, state: "active", revision: nextVersion }),
+							taskId,
+							round,
+						],
+					);
+				}
 				return {
 					kind: "claimed",
 					taskId,
