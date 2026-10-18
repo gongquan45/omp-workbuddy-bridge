@@ -90,8 +90,6 @@ async function stageRealSnapshot(options: {
 	sourceContent?: string;
 	inputRel?: string;
 	targetSessionId?: string;
-	/** Extra confirmed read paths (e.g. another task's outputs dir). */
-	extraReadPaths?: string[];
 }): Promise<{ input: ApprovedEnqueue; confirmation: RoundConfirmationV3 }> {
 	const inputRel = options.inputRel ?? "input.txt";
 	const targetSessionId = options.targetSessionId ?? "wb-session-1";
@@ -615,7 +613,6 @@ describe("project queue - real subprocess contention", () => {
 		// fixture binary with its own claim instruction; the SQLite write lock
 		// decides the winner, and the loser must observe either waiting or empty
 		// — never a second claimed attempt.
-		const raceOwner = owner({ processId: 0 });
 		const claimScript = `
 			import { openProjectQueue } from "${path.resolve(import.meta.dir, "../src/queue").replace(/\\/g, "/")}";
 			const queue = openProjectQueue(${JSON.stringify(root)}, { mode: "write" });
@@ -635,7 +632,8 @@ describe("project queue - real subprocess contention", () => {
 			// The loser sees the row already preparing: no claim, no crash.
 			expect(["waiting", "empty"]).toContain(other.kind);
 		}
-		expect(raceOwner.processId).toBe(0); // sanity: fixture uses its own pid
+		// The single winner must own the one attempt the round can have.
+		expect(claimed[0]?.taskId).toBe(TASK_A);
 	});
 
 	it("enqueues through a real child process and the parent sees the row", async () => {

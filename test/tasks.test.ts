@@ -217,11 +217,12 @@ describe("binding operations", () => {
 			expect(caughtError.code).toBe(WB_ERROR_CODE.bindingInvalid);
 		}
 
-		// Wrong schema version
+		// Wrong schema version: v1 and v2 are both supported now, so the
+		// unsupported case has to be a version this build never wrote.
 		await writeFile(
 			path.join(bridgeDir, "binding.json"),
 			JSON.stringify({
-				version: 2,
+				version: 3,
 				projectRoot,
 				sessionId: crypto.randomUUID(),
 				workbuddyVersion: "5.8.2",
