@@ -509,6 +509,36 @@ export function initializeProjectDatabase(db: Database, root: string): void {
 	writeMeta(db, "schema_version", String(QUEUE_SCHEMA_VERSION));
 }
 
+/**
+ * Enables dispatch for a project without requiring a bound session.
+ *
+ * A project may legitimately be enabled with an empty session pool: the plan
+ * allows it so a user who has not opened a WorkBuddy conversation yet can still
+ * authorise the project, and later sessions join the pool automatically. This is
+ * also the only enable path that does not go through an imported binding.
+ *
+ * Idempotent: an existing `project_enabled_at` is returned untouched, so a
+ * repeated setup never rewrites the original authorization time.
+ */
+export function enableProject(root: string, now: number = Date.now()): string {
+	const canonicalRoot = canonicalProjectRoot(root);
+	const db = openWriteConnection(canonicalRoot);
+	return withImmediate(db, () => {
+		// Enable is a state transition on an existing project, never a bootstrap:
+		// silently creating identity meta here would let a typo'd path pretend to
+		// be a project. Bootstrapping belongs to the migration/write-open path.
+		assertProjectDatabase(db, canonicalRoot);
+		const existing = readMeta(db, "project_enabled_at");
+		if (existing !== null) {
+			return existing;
+		}
+		const stamp = new Date(now).toISOString();
+		writeMeta(db, "project_enabled_at", stamp);
+		nextRevision(db);
+		return stamp;
+	});
+}
+
 /** Closes this process's connection for the project (one mode or both). */
 export function closeQueueConnection(root: string, mode?: "read" | "write"): void {
 	for (const key of [...connections.keys()]) {
@@ -856,7 +886,7 @@ class WriteQueue implements ProjectQueue {
 			if (enabledAt === null) {
 				throw new WbTaskError(
 					WB_ERROR_CODE.migrationRequired,
-					`Project ${this.root} is not enabled; run /wb bind (or the integration wizard) first`,
+					`Project ${this.root} is not enabled; run /wb setup (or /wb init) first`,
 				);
 			}
 			if (!isOwnerActive(this.db, {

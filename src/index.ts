@@ -15,6 +15,8 @@ import os from "node:os";
 import process from "node:process";
 import { connect, discover, inspectWorkers, type DesktopSession } from "./desktop-client";
 import { atomicWriteFile } from "./storage";
+import { enableProject, readProjectAccess, type ProjectAccess } from "./queue";
+import { migrateProjectToQueue } from "./migration";
 import {
 	collectArtifacts,
 	computeFileSha256,
@@ -166,6 +168,13 @@ interface DiagnosticIssue {
  */
 export interface BridgeOverrides {
 	discover?: (projectRoot: string, signal: AbortSignal) => Promise<DesktopCandidate[]>;
+	/**
+	 * Overrides the WorkBuddy global config directory.
+	 *
+	 * Setup writes ; tests must never touch the real
+	 * user home, so they inject a project-local directory instead.
+	 */
+	workbuddyHomeDir?: string;
 	connect?: (
 		binding: Binding,
 		callbacks: DesktopCallbacks,
@@ -194,6 +203,10 @@ export interface BridgeOverrides {
 	 * Exposed for tests, which cannot spend the real budget on every case.
 	 */
 	cancelSettleMs?: number;
+	migrateProject?: (projectRoot: string) => Promise<string>;
+	readProjectAccess?: (projectRoot: string) => Promise<ProjectAccess | null>;
+	enableProject?: (projectRoot: string) => Promise<string> | string;
+	whichBun?: (command: string) => string | null;
 }
 
 /** A task this OMP process currently owns and is tracking. */
@@ -308,6 +321,12 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 	const realReadTaskLock = overrides.readTaskLock ?? readTaskLock;
 	const realInspectWorkers = overrides.inspectWorkers ?? inspectWorkers;
 	const cancelSettleMs = overrides.cancelSettleMs ?? CANCEL_SETTLE_MS;
+	const realMigrateProject = overrides.migrateProject ?? migrateProjectToQueue;
+	const realReadProjectAccess = overrides.readProjectAccess ?? readProjectAccess;
+	const realEnableProject = overrides.enableProject ?? enableProject;
+	const realWhichBun =
+		overrides.whichBun ??
+		((cmd: string) => (typeof Bun !== "undefined" && typeof Bun.which === "function" ? Bun.which(cmd) : null));
 
 	let currentDraft: FrozenDraft | null = null;
 
@@ -419,7 +438,7 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 				}
 			}
 		} catch {
-			// Best effort
+			// Best effort: progress sync must never break the agent loop.
 		}
 	});
 
@@ -475,10 +494,51 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 		};
 	});
 	pi.registerCommand("wb", {
-		description: "WorkBuddy bridge management: bind, status, send, release, setup",
+		description: "WorkBuddy bridge management: init, bind, status, send, release, setup",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			const parts = args.trim().split(/\s+/);
 			const subcommand = parts[0] ?? "";
+			if (subcommand === "init") {
+				const projectRoot = await realpath(ctx.cwd).catch(() => ctx.cwd);
+				try {
+					await realMigrateProject(projectRoot);
+				} catch (error) {
+					if (error instanceof WbTaskError) {
+						ctx.ui.notify(`${error.code}: ${error.message}`, "error");
+						return;
+					}
+					ctx.ui.notify(`Failed to enable project state: ${messageOf(error)}`, "error");
+					return;
+				}
+				// Migration alone does not enable a project that had no binding to
+				// import. Assert the real state rather than announcing success: an
+				// "enabled" message on a still-disabled project sends the user
+				// straight into WB_MIGRATION_REQUIRED on their first delegation.
+				let access = await realReadProjectAccess(projectRoot).catch(() => null);
+				if (access !== null && access.migrated && !access.enabled) {
+					try {
+						await realEnableProject(projectRoot);
+						access = await realReadProjectAccess(projectRoot).catch(() => null);
+					} catch (error) {
+						ctx.ui.notify(`Could not enable project state: ${messageOf(error)}`, "error");
+						return;
+					}
+				}
+				if (access === null || !access.enabled || !access.migrated) {
+					const missing = access === null
+						? "database inaccessible"
+						: [!access.migrated ? "migration incomplete" : null, !access.enabled ? "project not enabled" : null]
+								.filter((part): part is string => part !== null)
+								.join(", ");
+					ctx.ui.notify(
+						`Project state was not enabled for ${projectRoot}: ${missing}. Next step: run /wb setup.`,
+						"error",
+					);
+					return;
+				}
+				ctx.ui.notify(`Project state enabled at ${projectRoot}`, "info");
+				return;
+			}
 			if (subcommand === "bind") {
 				await runBind(ctx);
 				return;
@@ -584,7 +644,7 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 				await runSetup(ctx);
 				return;
 			}
-			ctx.ui.notify(`Unknown /wb subcommand: ${subcommand}. Use /wb bind, /wb status, /wb send, /wb release, or /wb setup.`, "warning");
+			ctx.ui.notify(`Unknown /wb subcommand: ${subcommand}. Use /wb init, /wb bind, /wb status, /wb send, /wb release, or /wb setup.`, "warning");
 		},
 	});
 
@@ -945,11 +1005,18 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 	async function runStatus(ctx: ExtensionCommandContext): Promise<void> {
 		const projectRoot = await realpath(ctx.cwd).catch(() => ctx.cwd);
 		const lines: string[] = [];
-		const binding = await realReadBinding(projectRoot).catch(() => null);
-		if (binding === null) {
+		const resolved = await requireBinding(ctx);
+		if ("failure" in resolved) {
 			lines.push(`No binding for ${projectRoot}. Run /wb bind.`);
+			lines.push("Queue: not enabled yet (run /wb init to create and import project state)");
 		} else {
+			const { binding, access } = resolved;
 			lines.push(`Bound session: ${binding.sessionId} (WorkBuddy ${binding.workbuddyVersion})`);
+			lines.push(
+				access.enabled
+					? "Queue: enabled"
+					: "Queue: not enabled yet (run /wb init to create and import project state)",
+			);
 			try {
 				const candidates = await realDiscover(projectRoot, new AbortController().signal);
 				const match = candidates.find((entry) => entry.binding.sessionId === binding.sessionId);
@@ -973,10 +1040,13 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 		ctx.ui.notify(lines.join("\n"), "info");
 	}
 
-	/** Resolves the project's binding, refusing to work from an unbound folder. */
+	/**
+	 * Resolves the project's binding, refusing to work from an unbound folder.
+	 * Binding and queue-access are two distinct facts; stage 4 will make `enabled` mandatory.
+	 */
 	async function requireBinding(
 		ctx: ExtensionContext,
-	): Promise<{ binding: Binding; projectRoot: string } | { failure: AgentToolResult<unknown> }> {
+	): Promise<{ binding: Binding; projectRoot: string; access: ProjectAccess } | { failure: AgentToolResult<unknown> }> {
 		const projectRoot = await realpath(ctx.cwd).catch(() => ctx.cwd);
 		let binding: Binding | null;
 		try {
@@ -987,7 +1057,7 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 		if (binding === null) {
 			return {
 				failure: failureResult(
-					`No WorkBuddy binding for ${projectRoot}. Run /wb bind first.`,
+ 					`No WorkBuddy binding for ${projectRoot}. Run /wb bind first.`,
 					WB_ERROR_CODE.bindingInvalid,
 				),
 			};
@@ -1000,7 +1070,12 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 				),
 			};
 		}
-		return { binding, projectRoot };
+		const access = (await realReadProjectAccess(projectRoot)) ?? {
+			projectRoot,
+			enabled: false,
+			migrated: false,
+		};
+		return { binding, projectRoot, access };
 	}
 
 	async function runTask(
@@ -1598,10 +1673,14 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 
 		const repoRoot = path.dirname(__dirname);
 		const mcpEntrypoint = path.resolve(repoRoot, "src", "mcp.ts");
-		const bunExe = process.execPath;
+		const bunExe = realWhichBun("bun");
+		if (bunExe === null) {
+			ctx.ui.notify("Bun executable not found on PATH. Install Bun 1.4+ before configuring MCP.", "error");
+			return;
+		}
 
 		const ompMcpPath = path.join(projectRoot, ".omp", "mcp.json");
-		const homeDir = process.env.USERPROFILE || process.env.HOME || os.homedir();
+		const homeDir = overrides.workbuddyHomeDir ?? (process.env.USERPROFILE || process.env.HOME || os.homedir());
 		const wbMcpPath = path.join(homeDir, ".workbuddy", "mcp.json");
 
 		const ompEntry = {
@@ -1637,10 +1716,14 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 			return;
 		}
 
+		// Configuration and project enablement are separate concerns: a config file
+		// that cannot be written (a foreign entry already owns the name, a read-only
+		// profile) must not stop the project from being enabled. Failures are
+		// collected and reported honestly at the end.
+		const configFailures: string[] = [];
 		const ompUpdate = await updateMcpConfigFile(ompMcpPath, "omp-wb-bridge", ompEntry, projectRoot);
 		if (!ompUpdate.success) {
-			ctx.ui.notify(`Failed to update OMP config: ${ompUpdate.error}`, "error");
-			return;
+			configFailures.push(`OMP MCP config: ${ompUpdate.error}`);
 		}
 
 		const wbUpdate = await updateMcpConfigFile(
@@ -1651,18 +1734,110 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 			(msg, choices) => ctx.ui.select(msg, choices),
 		);
 		if (!wbUpdate.success) {
-			ctx.ui.notify(`Failed to update WorkBuddy config: ${wbUpdate.error}`, "error");
-			return;
+			configFailures.push(`WorkBuddy MCP config: ${wbUpdate.error}`);
 		}
 		try {
 			const skillSrc = path.join(repoRoot, "skills", "omp-wb-collaboration", "SKILL.md");
 			const skillDest = path.join(projectRoot, ".workbuddy", "skills", "omp-wb-collaboration", "SKILL.md");
 			await mkdir(path.dirname(skillDest), { recursive: true });
 			await copyFile(skillSrc, skillDest);
-		} catch {
-			// Best effort
+		} catch (error) {
+			// A missing collaboration skill degrades the workflow but must not stop
+			// the project from being enabled; report it with the other config gaps.
+			configFailures.push(`Collaboration skill: ${messageOf(error)}`);
+		}
+		// Enable entry point: binding check, migration, access verification
+		let binding = await realReadBinding(projectRoot).catch(() => null);
+		if (binding === null) {
+			let candidates: DesktopCandidate[] = [];
+			try {
+				candidates = await realDiscover(projectRoot, new AbortController().signal);
+			} catch {
+				// Discovery failure / no desktop: no candidate session
+			}
+			// A session is bound only by an explicit human choice: a project may
+			// have several WorkBuddy sessions, and picking the first silently would
+			// pin it to a session nobody selected. Cancelling keeps the project
+			// unbound, which is a legitimate state — it still gets enabled below.
+			if (candidates.length > 0) {
+				const labels = candidates.map(describeCandidate);
+				const picked = await ctx.ui.select("Bind this project to a WorkBuddy session", labels);
+				const index = picked === undefined ? -1 : labels.indexOf(picked);
+				const chosen = index >= 0 ? candidates[index] : undefined;
+				if (chosen !== undefined) {
+					binding = {
+						version: 1,
+						projectRoot,
+						sessionId: chosen.binding.sessionId,
+						workbuddyVersion: chosen.binding.workbuddyVersion,
+					};
+					await realWriteBinding(binding);
+				}
+			}
 		}
 
+		try {
+			await realMigrateProject(projectRoot);
+		} catch (error) {
+			if (error instanceof WbTaskError && error.code === WB_ERROR_CODE.migrationRequired) {
+				ctx.ui.notify(error.message, "error");
+				return;
+			}
+			if (error instanceof WbTaskError) {
+				ctx.ui.notify(`${error.code}: ${error.message}`, "error");
+				return;
+			}
+			ctx.ui.notify(`Migration failed: ${messageOf(error)}`, "error");
+			return;
+		}
+
+		// Migration enables a project only when it imported a binding. An empty
+		// pool is legal (a user may not have opened a WorkBuddy session yet), so
+		// the enable bit is set here instead of being inferred from a binding.
+		let access = await realReadProjectAccess(projectRoot).catch(() => null);
+		if (access !== null && access.migrated && !access.enabled) {
+			try {
+				await realEnableProject(projectRoot);
+				access = await realReadProjectAccess(projectRoot).catch(() => null);
+			} catch (error) {
+				ctx.ui.notify(`Could not enable project state: ${messageOf(error)}`, "error");
+				return;
+			}
+		}
+		if (access === null || !access.enabled || !access.migrated) {
+			const missing: string[] = [];
+			if (access === null) {
+				missing.push("database inaccessible");
+			} else {
+				if (!access.migrated) missing.push("migration incomplete");
+				if (!access.enabled) missing.push("project not enabled");
+			}
+			// `/wb bind` only writes binding.json; it never sets the enable bit, so
+			// pointing at it here would send the user in a circle.
+			const nextStep = !access || !access.migrated
+				? "run /wb setup again or check permissions on .wb-bridge"
+				: "run /wb init to enable the project, then /wb bind to choose a session";
+			ctx.ui.notify(
+				`Project state was not enabled for ${projectRoot}: ${missing.join(", ")}. Next step: ${nextStep}.`,
+				"error",
+			);
+			return;
+		}
+
+		if (configFailures.length > 0) {
+			// Configuration failures stay errors: a config file was left untouched
+			// because it holds a foreign entry, which is something the user must
+			// resolve. They no longer abort the run, so enabling still happened.
+			for (const failure of configFailures) {
+				ctx.ui.notify(failure, "error");
+			}
+			ctx.ui.notify(
+				`Project enabled at ${projectRoot}, but MCP configuration is incomplete. ` +
+					"Delegation works once a session is bound; fix the entries above to use the MCP tools.",
+				"warning",
+			);
+			return;
+		}
 		ctx.ui.notify("Successfully configured MCP for OMP and WorkBuddy.", "info");
 	}
 

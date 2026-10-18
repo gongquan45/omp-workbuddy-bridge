@@ -10,6 +10,7 @@ import {
 	publishWork,
 	type ProjectContextQuery,
 } from "./collaboration";
+import { readProjectAccess, type ProjectAccess } from "./queue";
 import { readTaskIndex, WbTaskError } from "./tasks";
 import { type WorkRecord, WB_ERROR_CODE } from "./types";
 
@@ -55,6 +56,14 @@ async function main(): Promise<void> {
 		process.exit(1);
 	}
 
+	let projectAccess: ProjectAccess | null = null;
+	try {
+		projectAccess = await readProjectAccess(canonicalRoot);
+	} catch (err: unknown) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new WbTaskError(WB_ERROR_CODE.storageError, message);
+	}
+
 	const server = new McpServer({
 		name: "omp-wb-bridge",
 		version: "2.0.0",
@@ -91,6 +100,23 @@ async function main(): Promise<void> {
 									error: {
 										code: WB_ERROR_CODE.bindingInvalid,
 										message: `Tool projectRoot "${args.projectRoot}" does not match server startup project "${canonicalRoot}"`,
+									},
+								}),
+							},
+						],
+					};
+				}
+
+				if (projectAccess !== null && projectAccess.projectRoot !== canonicalRoot) {
+					return {
+						isError: true,
+						content: [
+							{
+								type: "text",
+								text: JSON.stringify({
+									error: {
+										code: WB_ERROR_CODE.bindingInvalid,
+										message: `Project database root "${projectAccess.projectRoot}" does not match server startup project "${canonicalRoot}"`,
 									},
 								}),
 							},
@@ -139,10 +165,14 @@ async function main(): Promise<void> {
 					}
 				}
 
-				const serialized = JSON.stringify(result);
+				const response = {
+					...result,
+					projectAccess: projectAccess ?? { projectRoot: canonicalRoot, enabled: false, migrated: false },
+				};
+				const serialized = JSON.stringify(response);
 				return {
 					content: [{ type: "text", text: serialized }],
-					structuredContent: result as unknown as Record<string, unknown>,
+					structuredContent: response as unknown as Record<string, unknown>,
 				};
 			} catch (err: unknown) {
 				const code = err instanceof WbTaskError ? err.code : "WB_TASK_FAILED";
