@@ -13,7 +13,7 @@ import {
 	releaseWork,
 	withCollaborationLock,
 } from "../src/collaboration";
-import { computeFileSha256, WbTaskError } from "../src/tasks";
+import { computeFileSha256, delegatedWorkId, WbTaskError } from "../src/tasks";
 import { WB_ERROR_CODE } from "../src/types";
 
 const allocatedRoots: string[] = [];
@@ -507,5 +507,138 @@ describe("getProjectContext query and filtering", () => {
 		expect(detail.detail).toBeDefined();
 		expect(detail.detail?.record.title).toBe("Detailed Task");
 		expect(detail.detail?.artifacts.length).toBe(1);
+	});
+});
+
+describe("waiting work records", () => {
+	it("validates a waiting record instead of rejecting it", async () => {
+		const root = await createProjectRoot();
+		// The queue publishes a waiting record for every enqueued round; reading
+		// it back through the same validator must not fail, or migration and the
+		// workspace would silently drop those rows.
+		const record = {
+			version: 1 as const,
+			workId: delegatedWorkId("11111111-1111-4111-8111-111111111111", 1),
+			projectRoot: root,
+			owner: "omp" as const,
+			source: "delegated" as const,
+			taskId: "11111111-1111-4111-8111-111111111111",
+			round: 1,
+			nativeRef: null,
+			title: "Queued round",
+			scope: { readPaths: ["input.txt"], writePaths: [".wb-bridge/tasks/x/rounds/1/outputs"] },
+			state: "waiting" as const,
+			phase: "queued",
+			milestone: "",
+			blocker: "",
+			updatedAt: new Date().toISOString(),
+			revision: 1,
+			artifacts: [],
+			remoteResults: [],
+			reviews: [],
+		};
+		const collabDir = path.join(root, ".wb-bridge", "collaboration");
+		await mkdir(collabDir, { recursive: true });
+		await writeFile(path.join(collabDir, `${record.workId}.json`), JSON.stringify(record, null, 2), "utf-8");
+
+		const read = await readWorkRecord(root, record.workId);
+		expect(read?.state).toBe("waiting");
+		expect((await readAllWorkRecords(root)).some((r) => r.workId === record.workId)).toBe(true);
+	});
+
+	it("does not let a waiting scope block another claim", async () => {
+		const root = await createProjectRoot();
+		// Publish a waiting record covering a path, then claim that same path:
+		// waiting is a published-but-ungranted scope and never occupies.
+		const waitingId = delegatedWorkId("22222222-2222-4222-8222-222222222222", 1);
+		const collabDir = path.join(root, ".wb-bridge", "collaboration");
+		await mkdir(collabDir, { recursive: true });
+		await writeFile(
+			path.join(collabDir, `${waitingId}.json`),
+			JSON.stringify(
+				{
+					version: 1,
+					workId: waitingId,
+					projectRoot: root,
+					owner: "omp",
+					source: "delegated",
+					taskId: "22222222-2222-4222-8222-222222222222",
+					round: 1,
+					nativeRef: null,
+					title: "Queued, not granted",
+					scope: { readPaths: [], writePaths: ["src/blocked-by-nothing"] },
+					state: "waiting",
+					phase: "queued",
+					milestone: "",
+					blocker: "",
+					updatedAt: new Date().toISOString(),
+					revision: 1,
+					artifacts: [],
+					remoteResults: [],
+					reviews: [],
+				},
+				null,
+				2,
+			),
+			"utf-8",
+		);
+
+		const claimed = await claimWork(root, "omp", {
+			title: "Same path",
+			scope: { readPaths: [], writePaths: ["src/blocked-by-nothing"] },
+		});
+		expect(claimed.record.state).toBe("active");
+	});
+
+	it("refuses to promote a waiting record to an occupying state via publish", async () => {
+		const root = await createProjectRoot();
+		const waitingId = delegatedWorkId("33333333-3333-4333-8333-333333333333", 1);
+		const collabDir = path.join(root, ".wb-bridge", "collaboration");
+		await mkdir(collabDir, { recursive: true });
+		await writeFile(
+			path.join(collabDir, `${waitingId}.json`),
+			JSON.stringify(
+				{
+					version: 1,
+					workId: waitingId,
+					projectRoot: root,
+					owner: "omp",
+					source: "delegated",
+					taskId: "33333333-3333-4333-8333-333333333333",
+					round: 1,
+					nativeRef: null,
+					title: "Queued, not granted",
+					scope: { readPaths: [], writePaths: ["src/granted-by-claim-only"] },
+					state: "waiting",
+					phase: "queued",
+					milestone: "",
+					blocker: "",
+					updatedAt: new Date().toISOString(),
+					revision: 1,
+					artifacts: [],
+					remoteResults: [],
+					reviews: [],
+				},
+				null,
+				2,
+			),
+			"utf-8",
+		);
+
+		let caught: unknown = null;
+		try {
+			await publishWork(root, "omp", {
+				workId: waitingId,
+				expectedRevision: 1,
+				progress: { state: "active", phase: "running", milestone: "", blocker: "" },
+			});
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught instanceof WbTaskError).toBe(true);
+		if (caught instanceof WbTaskError) {
+			expect(caught.code).toBe(WB_ERROR_CODE.inputInvalid);
+			expect(caught.message).toContain("waiting for its scope grant");
+		}
 	});
 });

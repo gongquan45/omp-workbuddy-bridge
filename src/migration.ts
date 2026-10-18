@@ -19,44 +19,18 @@ import { readdir } from "node:fs/promises";
 import * as path from "node:path";
 import { canonicalProjectRoot, initializeProjectDatabase, openReadConnection, openWriteConnection, withImmediate, readMeta, writeMeta, nextRevision, closeQueueConnection } from "./queue";
 import { readAllWorkRecords } from "./collaboration";
-import { readBinding, readTask, readTaskLock, isPidAlive, WbTaskError } from "./tasks";
+import { delegatedWorkId, isPidAlive, readBinding, readTask, readTaskLock, uuid5, WbTaskError } from "./tasks";
 import { WB_ERROR_CODE, type TaskReceipt } from "./types";
 
 /** The DNS namespace UUIDv5 uses; the plan fixes it for legacy request ids. */
-const UUID5_DNS_NAMESPACE = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
-
 /**
- * Derives the deterministic legacy requestId for one imported round:
- * UUIDv5 over `omp-wb-bridge/legacy/<taskId>/<round>` in the DNS namespace,
- * so the same history always imports to the same identity.
+ * Derives the deterministic legacy requestId for one imported round.
+ *
+ * Same UUIDv5 recipe as every other derived identifier, in the legacy
+ * namespace so an imported round never collides with a live one.
  */
 export function legacyRequestId(taskId: string, round: number): string {
-	const name = `omp-wb-bridge/legacy/${taskId}/${round}`;
-	const namespace = uuidStringToBytes(UUID5_DNS_NAMESPACE);
-	const bytes = new Uint8Array(16 + name.length);
-	bytes.set(namespace, 0);
-	for (let i = 0; i < name.length; i++) {
-		bytes[16 + i] = name.charCodeAt(i) & 0xff;
-	}
-	const digest = new Uint8Array(awaitCryptoDigest(bytes));
-	// Set version 5 and variant bits per RFC 4122.
-	digest[6] = ((digest[6] ?? 0) & 0x0f) | 0x50;
-	digest[8] = ((digest[8] ?? 0) & 0x3f) | 0x80;
-	const hex = [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
-	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
-}
-
-function uuidStringToBytes(uuid: string): Uint8Array {
-	const hex = uuid.replace(/-/g, "");
-	const bytes = new Uint8Array(16);
-	for (let i = 0; i < 16; i++) {
-		bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-	}
-	return bytes;
-}
-
-function awaitCryptoDigest(bytes: Uint8Array): Uint8Array {
-	return createHash("sha1").update(bytes).digest();
+	return uuid5(`omp-wb-bridge/legacy/${taskId}/${round}`);
 }
 
 /** Legacy receipt status normalization: running states become interrupted. */
@@ -281,7 +255,7 @@ export async function migrateProjectToQueue(root: string): Promise<string> {
 					}
 					// A legacy receipt-only task gets its historical work record so
 					// receipt-only and collaboration-linked projects merge uniformly.
-					const workId = `work-${taskId}-${round.number}`;
+					const workId = delegatedWorkId(taskId, round.number);
 					db.run(
 						`INSERT OR IGNORE INTO works(work_id, revision, state, record_json, task_id, round)
 						 VALUES(?, ?, 'released', ?, ?, ?)`,
@@ -320,7 +294,7 @@ export async function migrateProjectToQueue(root: string): Promise<string> {
 			// same workId as a same-id receipt round where one exists.
 			for (const record of works) {
 				const round = record.round ?? 0;
-				const workId = record.taskId !== null ? `work-${record.taskId}-${round}` : record.workId;
+				const workId = record.taskId !== null ? delegatedWorkId(record.taskId, round) : record.workId;
 				db.run(
 					`INSERT INTO works(work_id, revision, state, record_json, task_id, round)
 					 VALUES(?, ?, ?, ?, ?, ?)

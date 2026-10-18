@@ -801,7 +801,13 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 					} else {
 						await withCollaborationLock(task.receipt.projectRoot, async () => {
 							const existingRec = await readWorkRecord(task.receipt.projectRoot, task.taskId);
-							if (existingRec && existingRec.state !== "released") {
+							// Only a record that already occupies scope may become
+							// blocked: promoting a `waiting` record here would mint an
+							// occupancy the round never held.
+							if (
+								existingRec &&
+								(existingRec.state === "active" || existingRec.state === "blocked")
+							) {
 								existingRec.state = "blocked";
 								existingRec.blocker = status;
 								existingRec.updatedAt = new Date().toISOString();

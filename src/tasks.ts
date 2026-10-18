@@ -2120,3 +2120,50 @@ export async function stageTask(
 		},
 	};
 }
+
+// ---------------------------------------------------------------------------
+// Deterministic identifiers
+//
+// Collision-free ids derived from stable inputs (task id + round) rather than
+// random UUIDs, so the same logical round always maps to the same record.
+// RFC 4122 UUIDv5 in the DNS namespace, matching the legacy receipt importer.
+// ---------------------------------------------------------------------------
+
+/** The UUIDv5 DNS namespace; fixed by RFC 4122. */
+export const UUID5_DNS_NAMESPACE = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+
+/** Renders a UUIDv5 over `name` in the DNS namespace. */
+export function uuid5(name: string): string {
+	const namespace = uuidStringToBytes(UUID5_DNS_NAMESPACE);
+	const bytes = new Uint8Array(16 + name.length);
+	bytes.set(namespace, 0);
+	for (let i = 0; i < name.length; i++) {
+		bytes[16 + i] = name.charCodeAt(i) & 0xff;
+	}
+	const digest = new Uint8Array(crypto.createHash("sha1").update(bytes).digest());
+	// Version 5 and RFC 4122 variant bits.
+	digest[6] = ((digest[6] ?? 0) & 0x0f) | 0x50;
+	digest[8] = ((digest[8] ?? 0) & 0x3f) | 0x80;
+	const hex = [...digest].map((b) => b.toString(16).padStart(2, "0")).join("");
+	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
+function uuidStringToBytes(uuid: string): Uint8Array {
+	const hex = uuid.replace(/-/g, "");
+	const bytes = new Uint8Array(16);
+	for (let i = 0; i < 16; i++) {
+		bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+	}
+	return bytes;
+}
+
+/**
+ * The work id for one delegated round.
+ *
+ * The collaboration layer validates `workId` as a UUID, so the queue and the
+ * receipt importer must both derive this same deterministic value rather than
+ * composing a `work-<taskId>-<round>` string that cannot be read back.
+ */
+export function delegatedWorkId(taskId: string, round: number): string {
+	return uuid5(`omp-wb-bridge/work/${taskId}/${round}`);
+}

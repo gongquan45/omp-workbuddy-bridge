@@ -19,6 +19,7 @@ import {
 } from "../src/queue";
 import {
 	buildTaskManifestPayload,
+	delegatedWorkId,
 	hashManifestPayload,
 	stageTask,
 } from "../src/tasks";
@@ -450,7 +451,9 @@ describe("project queue - claim arbitration", () => {
 			const conflicting = queue.claim(otherOwner, Date.now());
 			expect(conflicting).toMatchObject({ kind: "waiting", reason: "scope_conflict" });
 			if (conflicting.kind === "waiting") {
-				expect(conflicting.blockerIds[0]).toContain(TASK_A);
+				// The blocker is the occupying round's work id, which is derived
+				// from task+round rather than composed from the task id.
+				expect(conflicting.blockerIds[0]).toBe(delegatedWorkId(TASK_A, 1));
 			}
 			// read/read sharing: a third round on a third WorkBuddy session reading
 			// the same input as the running task (write path distinct) claims fine.

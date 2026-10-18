@@ -16,7 +16,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import * as path from "node:path";
-import { hashManifestPayload, WbTaskError } from "./tasks";
+import { delegatedWorkId, hashManifestPayload, WbTaskError } from "./tasks";
 import { WB_ERROR_CODE, type ManifestInput, type OwnerIdentity, type TaskManifestPayload } from "./types";
 
 /** Schema version this module writes; readers refuse anything else. */
@@ -947,7 +947,7 @@ class WriteQueue implements ProjectQueue {
 			// migration can validate it with the existing domain validator.
 			const workRecord = {
 				version: 1 as const,
-				workId: `work-${payloadTaskId}-${payloadRound}`,
+				workId: delegatedWorkId(payloadTaskId, payloadRound),
 				projectRoot: this.root,
 				owner: "omp" as const,
 				source: "delegated" as const,
@@ -1042,7 +1042,7 @@ class WriteQueue implements ProjectQueue {
 					const record = JSON.parse(row.record_json) as {
 						scope: { readPaths: string[]; writePaths: string[] } | null;
 					};
-					if (record.scope === null || row.work_id === `work-${taskId}-${round}`) {
+					if (record.scope === null || row.work_id === delegatedWorkId(taskId, round)) {
 						return false;
 					}
 					// Read/read shares; any write against a read or write overlaps.

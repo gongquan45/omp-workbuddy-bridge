@@ -239,8 +239,16 @@ export function validateWorkRecord(raw: unknown, source: string): WorkRecord {
 	if (r.source !== "native" && r.source !== "delegated") {
 		throw new WbTaskError(WB_ERROR_CODE.taskStateInvalid, `Malformed work record at ${source}: source must be native or delegated`);
 	}
-	if (r.state !== "active" && r.state !== "blocked" && r.state !== "released") {
-		throw new WbTaskError(WB_ERROR_CODE.taskStateInvalid, `Malformed work record at ${source}: state must be active, blocked, or released`);
+	if (
+		r.state !== "waiting" &&
+		r.state !== "active" &&
+		r.state !== "blocked" &&
+		r.state !== "released"
+	) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.taskStateInvalid,
+			`Malformed work record at ${source}: state must be waiting, active, blocked, or released`
+		);
 	}
 	if (typeof r.title !== "string") {
 		throw new WbTaskError(WB_ERROR_CODE.taskStateInvalid, `Malformed work record at ${source}: title must be a string`);
@@ -430,7 +438,10 @@ export async function checkScopeConflict(
 ): Promise<void> {
 	const allRecords = await readAllWorkRecords(projectRoot);
 	for (const rec of allRecords) {
-		if (rec.workId === currentWorkId || rec.state === "released" || rec.scope === null) {
+		// Occupancy is only `active`/`blocked`: a `waiting` record is a published
+		// but not-yet-granted scope and must never block anyone. Never invert this
+		// back into `state !== "released"`.
+		if (rec.workId === currentWorkId || (rec.state !== "active" && rec.state !== "blocked") || rec.scope === null) {
 			continue;
 		}
 		// Check proposed writePaths against existing read and write paths
@@ -665,6 +676,17 @@ export async function publishWork(
 					`Work ${existing.workId} is already released; only reviews can be appended`
 				);
 			}
+		}
+
+		// A `waiting` record holds a published-but-ungranted scope. Only the
+		// queue's claim path may grant it, so publish must not move it into an
+		// occupying state. `progress.state` cannot express "stay waiting", so any
+		// progress update on such a record is refused.
+		if (existing.state === "waiting" && request.progress !== undefined) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.inputInvalid,
+				`Work ${existing.workId} is waiting for its scope grant; publish cannot update it`
+			);
 		}
 
 		let updatedState = existing.state;
