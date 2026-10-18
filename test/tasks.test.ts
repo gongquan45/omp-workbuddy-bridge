@@ -16,12 +16,24 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import process from "node:process";
-import type { Binding, TaskReceipt, TaskStatus, RoundConfirmation } from "../src/types";
+import type {
+	Binding,
+	OwnerIdentity,
+	RoundConfirmation,
+	RoundConfirmationV3,
+	StagedTask,
+	TaskGoal,
+	TaskReceipt,
+	TaskRequest,
+	TaskStatus,
+} from "../src/types";
 import { WB_ERROR_CODE } from "../src/types";
 import {
+	buildTaskManifestPayload,
 	collectArtifacts,
 	computeFileSha256,
 	currentRound,
+	hashManifestPayload,
 	isPidAlive,
 	prepareTask,
 	readBinding,
@@ -29,6 +41,7 @@ import {
 	readTaskIndex,
 	readTaskLock,
 	releaseTask,
+	stageTask,
 	WbTaskError,
 	writeBinding,
 	writeTask,
@@ -118,6 +131,16 @@ afterEach(async () => {
  * Creates an isolated temporary directory resolved to its canonical realpath.
  * Canonical resolution avoids Windows 8.3 short names and casing discrepancies.
  */
+/** True when the path exists; used to prove a refused stage left nothing. */
+async function pathExists(target: string): Promise<boolean> {
+	try {
+		await stat(target);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 async function createProjectRoot(): Promise<string> {
 	const raw = await mkdtemp(path.join(os.tmpdir(), "wb-tasks-test-"));
 	const canonical = await realpath(raw);
@@ -1403,5 +1426,175 @@ describe("readTaskIndex history listing", () => {
 		const index = await readTaskIndex(projectRoot);
 		expect(index.entries.map((entry) => entry.taskId)).toEqual([okay]);
 		expect(index.warnings.map((warning) => warning.taskId)).toEqual([leaked]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// stageTask: the frozen input snapshot a queued round executes against.
+//
+// These are the mutation cases: a happy path is covered by the queue suite,
+// but nothing there proves a changed source, a missing file, an escaping link
+// or a drifted confirmation is actually refused. Every case asserts on the
+// on-disk side effect too, because "threw" is not the same as "left nothing".
+// ---------------------------------------------------------------------------
+
+const STAGE_TASK_ID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+const STAGE_REQUEST_ID = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+
+function stageOwner(): OwnerIdentity {
+	return { sessionId: "omp-stage-session", generation: "gen-stage", processId: 424242, instanceId: "stage-instance" };
+}
+
+function stageGoal(): TaskGoal {
+	return {
+		objective: "stage and verify",
+		context: "",
+		constraints: [],
+		acceptance: ["copy matches"],
+		externalActions: [],
+	};
+}
+
+/** Builds a confirmation for the current source bytes, then stages it. */
+async function stageOnce(
+	rootDir: string,
+	inputRel: string,
+	options: { expectedOutputs?: string[]; mutateBeforeStage?: () => Promise<void> } = {},
+): Promise<{ staged: StagedTask; confirmation: RoundConfirmationV3; sourceSha: string }> {
+	const expectedOutputs = options.expectedOutputs ?? ["staged-output.txt"];
+	const sourcePath = path.join(rootDir, inputRel);
+	const sourceSha = await computeFileSha256(sourcePath);
+	const sourceBytes = (await stat(sourcePath)).size;
+	const payload = buildTaskManifestPayload({
+		projectRoot: rootDir,
+		requestId: STAGE_REQUEST_ID,
+		taskId: STAGE_TASK_ID,
+		round: 1,
+		owner: stageOwner(),
+		goal: stageGoal(),
+		targetPolicy: { kind: "session", sessionId: "wb-stage" },
+		expectedOutputs,
+		inputs: [{ path: inputRel, snapshotPath: `inputs/${inputRel}`, bytes: sourceBytes, sha256: sourceSha }],
+		deliveryMode: "foreground",
+	});
+	const confirmation: RoundConfirmationV3 = {
+		source: "host_dialog",
+		at: new Date().toISOString(),
+		targetPolicy: { kind: "session", sessionId: "wb-stage" },
+		requestId: STAGE_REQUEST_ID,
+		manifestSha256: hashManifestPayload(payload),
+		owner: stageOwner(),
+		previousRound: 0,
+		inputs: [{ path: inputRel, sha256: sourceSha }],
+		deliveryMode: "foreground",
+	};
+	if (options.mutateBeforeStage !== undefined) {
+		await options.mutateBeforeStage();
+	}
+	const request: TaskRequest = { goal: stageGoal(), inputFiles: [inputRel], expectedOutputs };
+	const staged = await stageTask(rootDir, confirmation, request, STAGE_TASK_ID, 1);
+	return { staged, confirmation, sourceSha };
+}
+
+describe("stageTask frozen snapshots", () => {
+	it("keeps the frozen copy byte-identical after the source changes", async () => {
+		const rootDir = await createProjectRoot();
+		await writeFile(path.join(rootDir, "staged-input.txt"), "confirmed bytes\n", "utf-8");
+		const { staged, sourceSha } = await stageOnce(rootDir, "staged-input.txt");
+
+		// The caller edits the source after enqueue: execution must read the copy.
+		await writeFile(path.join(rootDir, "staged-input.txt"), "mutated after enqueue\n", "utf-8");
+		const copyPath = path.join(staged.snapshotRoot, "inputs", "staged-input.txt");
+		expect(await readFile(copyPath, "utf-8")).toBe("confirmed bytes\n");
+		expect(await computeFileSha256(copyPath)).toBe(sourceSha);
+		expect(staged.manifestSha256).toBe(hashManifestPayload(staged.manifest.payload));
+	});
+
+	it("refuses a source that changed between confirmation and staging", async () => {
+		const rootDir = await createProjectRoot();
+		const sourcePath = path.join(rootDir, "staged-input.txt");
+		await writeFile(sourcePath, "first bytes\n", "utf-8");
+		let caught: unknown = null;
+		try {
+			await stageOnce(rootDir, "staged-input.txt", {
+				mutateBeforeStage: async () => {
+					await writeFile(sourcePath, "second bytes\n", "utf-8");
+				},
+			});
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught instanceof WbTaskError).toBeTrue();
+		if (caught instanceof WbTaskError) {
+			expect(caught.code).toBe(WB_ERROR_CODE.inputInvalid);
+		}
+		// No stage was published for the refused round.
+		expect(await pathExists(path.join(rootDir, ".wb-bridge", "requests", STAGE_REQUEST_ID))).toBeFalse();
+	});
+
+	it("refuses a missing confirmed input and leaves no stage directory", async () => {
+		const rootDir = await createProjectRoot();
+		const sourcePath = path.join(rootDir, "vanishing.txt");
+		await writeFile(sourcePath, "soon gone\n", "utf-8");
+		let caught: unknown = null;
+		try {
+			await stageOnce(rootDir, "vanishing.txt", {
+				mutateBeforeStage: async () => {
+					await unlink(sourcePath);
+				},
+			});
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught instanceof WbTaskError).toBeTrue();
+		if (caught instanceof WbTaskError) {
+			expect(caught.code).toBe(WB_ERROR_CODE.inputInvalid);
+		}
+		expect(await pathExists(path.join(rootDir, ".wb-bridge", "requests", STAGE_REQUEST_ID))).toBeFalse();
+	});
+
+	directoryLinkTest("refuses an input that resolves through an external directory link", async () => {
+		const rootDir = await createProjectRoot();
+		const outside = await createProjectRoot();
+		await writeFile(path.join(outside, "secret.txt"), "outside bytes\n", "utf-8");
+		try {
+			await symlink(outside, path.join(rootDir, "escape-dir"), "junction");
+		} catch {
+			return; // The host denied the link; the guard already skipped nothing.
+		}
+		const inputRel = "escape-dir/secret.txt";
+		let caught: unknown = null;
+		try {
+			await stageOnce(rootDir, inputRel);
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught instanceof WbTaskError).toBeTrue();
+		if (caught instanceof WbTaskError) {
+			expect(caught.code).toBe(WB_ERROR_CODE.inputInvalid);
+		}
+	});
+
+	it("refuses a request whose input set differs from the confirmation", async () => {
+		const rootDir = await createProjectRoot();
+		await writeFile(path.join(rootDir, "staged-input.txt"), "bytes\n", "utf-8");
+		await writeFile(path.join(rootDir, "extra.txt"), "extra\n", "utf-8");
+		const { confirmation } = await stageOnce(rootDir, "staged-input.txt");
+		const drifted: TaskRequest = {
+			goal: stageGoal(),
+			// Names a file the human never confirmed.
+			inputFiles: ["staged-input.txt", "extra.txt"],
+			expectedOutputs: ["staged-output.txt"],
+		};
+		let caught: unknown = null;
+		try {
+			await stageTask(rootDir, confirmation, drifted, STAGE_TASK_ID, 1);
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught instanceof WbTaskError).toBeTrue();
+		if (caught instanceof WbTaskError) {
+			expect(caught.code).toBe(WB_ERROR_CODE.inputInvalid);
+		}
 	});
 });

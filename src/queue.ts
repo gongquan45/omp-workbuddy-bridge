@@ -830,6 +830,15 @@ class WriteQueue implements ProjectQueue {
 				`Stage manifest at ${input.manifestPath} hashes to ${recomputedSha}, not the confirmed ${input.manifestSha256}`,
 			);
 		}
+		// The approval must cover the manifest being enqueued. Without this the
+		// two digests would each pass their own check while describing different
+		// payloads, and a human could approve one round while another executed.
+		if (input.approval.payloadSha256 !== recomputedSha) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.revisionConflict,
+				`Approval covers payload ${input.approval.payloadSha256}, but the stage manifest is ${recomputedSha}`,
+			);
+		}
 		// Snapshot paths resolve against the stage root; a mismatched root would
 		// make every frozen digest unverifiable at execution time.
 		const manifestDir = path.dirname(input.manifestPath);
