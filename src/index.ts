@@ -1087,7 +1087,18 @@ export default function activate(pi: ExtensionAPI, overrides: BridgeOverrides = 
 		if ("failure" in resolved) {
 			return resolved.failure;
 		}
-		const { binding, projectRoot } = resolved;
+		const { binding, projectRoot, access } = resolved;
+		// A binding alone does not authorize dispatch: the project must also be
+		// enabled. Refusing here (rather than deep inside the queue) is what makes
+		// an un-migrated or un-enabled project fail on its first delegation instead
+		// of silently running on the legacy file-based path.
+		if (!access.enabled || !access.migrated) {
+			const missing = !access.migrated ? "project state has not been migrated" : "project is not enabled";
+			return failureResult(
+				`${missing} for ${projectRoot}. Run /wb setup to migrate and enable it.`,
+				WB_ERROR_CODE.migrationRequired,
+			);
+		}
 
 		if (typeof params.goal !== "object" || params.goal === null) {
 			return failureResult("Task goal must be an object", WB_ERROR_CODE.inputInvalid);

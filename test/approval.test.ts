@@ -293,6 +293,15 @@ class Harness {
 							sessionId: SESSION_ID,
 							workbuddyVersion: "1.2.3",
 						},
+			// These tests exercise the v2 dispatch path with a stand-in binding and
+			// no database; report the project as enabled so the entry gate does not
+			// reject them. The gate itself is covered by integration-auth's
+			// un-enabled-project case.
+			readProjectAccess: async () => ({
+				projectRoot: this.bindingRoot,
+				enabled: true,
+				migrated: true,
+			}),
 			writeBinding: async () => {
 				this.writtenBindingCalls += 1;
 			},

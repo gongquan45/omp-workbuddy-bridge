@@ -6,6 +6,8 @@ import process from "node:process";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { computeFileSha256 } from "../src/tasks";
+import { migrateProjectToQueue } from "../src/migration";
+import { enableProject } from "../src/queue";
 import { WB_ERROR_CODE } from "../src/types";
 
 const allocatedRoots: string[] = [];
@@ -15,6 +17,10 @@ async function createProjectRoot(): Promise<string> {
 	const raw = await mkdtemp(path.join(os.tmpdir(), "mcp-test-suite-"));
 	const canonical = await realpath(raw);
 	allocatedRoots.push(canonical);
+	// The MCP server refuses mutating tools on a project that is not enabled, so
+	// the fixture has to be in the same state a real /wb setup leaves behind.
+	await migrateProjectToQueue(canonical).catch(() => undefined);
+	await enableProject(canonical);
 	return canonical;
 }
 

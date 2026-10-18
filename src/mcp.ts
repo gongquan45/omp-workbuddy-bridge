@@ -227,6 +227,26 @@ async function main(): Promise<void> {
 					};
 				}
 
+
+				// A mutating tool must not act on a project that was never enabled:
+				// claiming scope or publishing deliverables would otherwise create
+				// durable state the rest of the bridge refuses to read.
+				if (projectAccess === null || !projectAccess.enabled || !projectAccess.migrated) {
+					return {
+						isError: true,
+						content: [
+							{
+								type: "text",
+								text: JSON.stringify({
+									error: {
+										code: WB_ERROR_CODE.migrationRequired,
+										message: `Project "${canonicalRoot}" is not enabled; run /wb setup (or /wb init) in OMP first.`,
+									},
+								}),
+							},
+						],
+					};
+				}
 				const claimResult = await claimWork(canonicalRoot, cli.agent, {
 					workId: args.workId,
 					expectedRevision: args.expectedRevision,
@@ -335,6 +355,26 @@ async function main(): Promise<void> {
 					};
 				}
 
+
+				// A mutating tool must not act on a project that was never enabled:
+				// claiming scope or publishing deliverables would otherwise create
+				// durable state the rest of the bridge refuses to read.
+				if (projectAccess === null || !projectAccess.enabled || !projectAccess.migrated) {
+					return {
+						isError: true,
+						content: [
+							{
+								type: "text",
+								text: JSON.stringify({
+									error: {
+										code: WB_ERROR_CODE.migrationRequired,
+										message: `Project "${canonicalRoot}" is not enabled; run /wb setup (or /wb init) in OMP first.`,
+									},
+								}),
+							},
+						],
+					};
+				}
 				const published: WorkRecord = await publishWork(canonicalRoot, cli.agent, {
 					workId: args.workId,
 					expectedRevision: args.expectedRevision,

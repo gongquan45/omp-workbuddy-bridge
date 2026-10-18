@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdtemp, realpath, rm, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -370,5 +370,44 @@ describe("enable path: empty pool and explicit session choice", () => {
 		const second = ids[1];
 		expect(second).toBeDefined();
 		expect(written).toEqual([second]);
+	});
+});
+
+describe("enable gate at the task entry", () => {
+	it("refuses dispatch when a binding exists but the project is not enabled", async () => {
+		const projectRoot = await createProjectRoot();
+		const sessionId = "77777777-8888-4999-8aaa-bbbbbbbbbbbb";
+
+		// A binding on disk with no database: exactly the state a v2 user is in
+		// after upgrading. The entry gate must refuse, not fall through to the
+		// legacy dispatch path.
+		await mkdir(path.join(projectRoot, ".wb-bridge"), { recursive: true });
+		await writeFile(
+			path.join(projectRoot, ".wb-bridge", "binding.json"),
+			JSON.stringify({ version: 1, projectRoot, sessionId, workbuddyVersion: "5.8.2" }),
+			"utf-8",
+		);
+
+		const { tools } = makeMockApi({
+			workbuddyHomeDir: path.join(projectRoot, ".test-home"),
+			discover: async () => [],
+		});
+		const { ctx } = makeMockContext(projectRoot);
+
+		const taskTool = tools.get("wb_task");
+		expect(taskTool).toBeDefined();
+		const result = await taskTool!.execute(
+			"call-gate",
+			{ goal: { objective: "should be refused", acceptance: ["x"] } },
+			undefined,
+			undefined,
+			ctx as unknown as ExtensionContext,
+		);
+
+		expect(result.isError).toBe(true);
+		const details = result.details as { error?: { code?: string } } | undefined;
+		expect(details?.error?.code).toBe(WB_ERROR_CODE.migrationRequired);
+		// The refusal names the command that actually enables a project.
+		expect(JSON.stringify(result)).toContain("/wb setup");
 	});
 });
