@@ -674,9 +674,24 @@ describe("scopesConflict domain rules", () => {
 		expect(scopesConflict({ readPaths: [], writePaths: ["../escape"] }, { readPaths: [], writePaths: ["out/a"] })).toBeTrue();
 	});
 
-	it("normalizes separators and case before comparing on win32", () => {
+	it("normalizes separators before comparing", () => {
 		// Same logical path written two ways must conflict, not slip through.
 		expect(scopesConflict({ readPaths: [], writePaths: ["out/a.ts"] }, { readPaths: [], writePaths: ["out\\a.ts"] })).toBeTrue();
+	});
+
+	it("treats case-differing paths as the same file on win32", () => {
+		// Windows resolves Out/A.ts and out/a.ts to one file, so two scopes that
+		// differ only in case must conflict. On POSIX the same pair is genuinely
+		// two distinct files and must not conflict.
+		if (process.platform === "win32") {
+			expect(pathsOverlap("Out/A.ts", "out/a.ts")).toBeTrue();
+			expect(pathsOverlap("Out", "out/a.ts")).toBeTrue();
+			expect(
+				scopesConflict({ readPaths: [], writePaths: ["Out/A.ts"] }, { readPaths: [], writePaths: ["out/a.ts"] }),
+			).toBeTrue();
+		} else {
+			expect(pathsOverlap("Out/A.ts", "out/a.ts")).toBeFalse();
+		}
 	});
 });
 
