@@ -12,3 +12,8 @@ node_modules/
 /CHANGELOG.md
 /memorix-dual-client-validation-report.md
 /WorkBuddy工作原理与意图场景全景报告.md
+
+# Incident evidence: never commit binary archives or recovered stray files
+/_recovered/
+/memorix-report-backup.md
+/omp-wb-bridge-requirements-backup.md

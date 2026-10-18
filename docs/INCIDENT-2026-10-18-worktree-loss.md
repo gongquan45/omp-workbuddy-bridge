@@ -34,7 +34,7 @@
 | 2026-10-18 16:43:27 | **目录 `LastWriteTime` 定格于此** — 清空发生时刻 |
 | 2026-10-18 16:49 | 从会话 transcript 恢复出首批文件（`_recovered/`） |
 | 2026-10-18 17:20 | 当前会话 transcript 最后写入 |
-| 2026-10-18（稍后） | 发现远端完好，克隆验证基线绿（临时基线副本，已于同日清理并入 `OMP-WorkBuddy`） |
+| 2026-10-18（稍后） | 发现远端完好，克隆至 `E:\Desktop\omp-wb-remote`，验证基线绿 |
 
 事故窗口：首个包含缺陷 `afterEach` 的测试文件被创建后，到其首次在含编译错误的状态下运行之间。
 
@@ -192,10 +192,21 @@ afterEach(async () => {
 
 **基线的具体验证方法**（使报告可复核，而非仅叙述）：
 
+当年实际执行的是下面的命令（在 `E:\Desktop\omp-wb-remote` 就地 `git stash`）：
+
 ```sh
-# 克隆到任意临时目录即可复现，不依赖任何桌面路径
-git clone https://github.com/gongquan45/omp-workbuddy-bridge.git /tmp/wb-baseline
-cd /tmp/wb-baseline
+cd E:/Desktop/omp-wb-remote
+git stash -q -u      # 移出全部移植文件，回到纯 9f01805
+bun test             # → 185 pass / 1 skip / 0 fail（共 186 项）
+bun run typecheck    # → 0 错误
+git stash pop        # 恢复移植文件
+```
+
+该目录已清理。等效复现路径（任意临时目录，2026-10-18 实测确认输出一致）：
+
+```sh
+git clone https://github.com/gongquan45/omp-workbuddy-bridge.git <任意临时目录>
+cd <该目录>
 git checkout 9f01805
 bun install
 bun test             # → 185 pass / 1 skip / 0 fail（共 186 项）
@@ -206,7 +217,7 @@ bun run typecheck    # → 0 错误
 
 ### 6.2 当前状态（本报告编写时）
 
-工作树：`E:\Desktop\OMP-WorkBuddy`（规范工作树；临时基线副本已清理）
+工作树：`E:\Desktop\omp-wb-remote`（克隆自远端 `9f01805`）
 
 | 指标 | 值 |
 |---|---|
@@ -269,3 +280,49 @@ bun run typecheck    # → 0 错误
 ---
 
 **报告结论**：事故为**单一代码缺陷导致的自我删除**，非外部攻击或环境故障。基线可完整恢复、Stage 1–3 核心模块已恢复至验证终态、事故防护已落地。不可恢复的仅为 6 个从未推送的本地提交（约 3,000–4,000 行增量）。当前工作树处于"基线绿 + 增量移植中"的状态，距离重新全绿还差 18 个类型错误的接线工作。
+
+---
+
+## 9. 后续状态更新（2026-10-18 晚）
+
+前文 §1–§8 保留事故当时（16:43 前后）的真实快照，**不改写**：§6.2 的 "18 个类型错误 / 196 pass / 2 fail" 是当时的实际状态，`E:\Desktop\omp-wb-remote` 是当时的工作树位置。本节记录此后进展。
+
+### 9.1 恢复与验收
+
+| 项目 | 事故当时 | 2026-10-18 晚 |
+|---|---|---|
+| typecheck | 18 个错误 | **0 错误** |
+| 测试 | 196 pass / 2 fail | **266 pass / 1 skip / 0 fail（267 项 / 11 文件 / 860 断言）** |
+| 工作树 | `E:\Desktop\omp-wb-remote` | **`E:\Desktop\OMP-WorkBuddy`**（规范工作树） |
+| 远端 | `9f01805` | **`0a95ca9`**，9 个提交已推送 |
+| 独立克隆验证 | — | ✅ 全新克隆 `0a95ca9` + `bun install` → 0 错误 / 266 pass / 0 fail |
+
+"增量移植中"已完成：事故前丢失的 Stage 1–3 核心模块（`scope.ts`、`queue.ts` 落地、`migration.ts`、`collaboration.ts`、`logging.ts` 及对应测试）全部重建并验证。
+
+### 9.2 事故防护的可证伪验证
+
+防护不只是写进了代码，而是被证明能挡住同类错误：
+
+- `canonicalProjectRoot("")` 抛 `WB_INPUT_INVALID`，不再回退 `path.resolve("")`
+- 三套测试用例具备 `rootReady` + `path.isAbsolute(root)` + `length >= 8` 三重守卫
+- 本轮另有三条用例做过**反向验证**（破坏实现 → 用例必须失败 → 恢复），确认断言不是单边成立
+
+### 9.3 参考树归档（原路径已失效）
+
+`E:\Desktop\omp-workbuddy-recovery` 与 `E:\Desktop\omp-wb-remote` 均已清理。原目录内容归档于：
+
+```
+E:\Desktop\OMP-WorkBuddy\_recovered\incident-2026-10-18-recovery.tar.gz
+SHA-256: a4ed14e501b60fd59bf37901effa496c330936b9cccff4fb4754c8ba634d7fa8
+```
+
+归档内含 `tree/`（含 **3 个仅本地提交** `76da45b → 7e9f149 → da69531`，远端不存在）、`versions/`（52 个逐文件中间版本）、`.scratch/`（27 个协议提取脚本）。校验方式为解包后逐文件 SHA-256 比对，**192 个文件全部相同**；`tree/node_modules`（840M）已排除，可由 `bun install` 再生。
+
+**这是事故唯一不可再生的证据。** 现有两份物理副本（同一 SHA-256）：
+
+| 副本 | 位置 |
+|---|---|
+| 主副本 | `E:\Desktop\OMP-WorkBuddy\_recovered\incident-2026-10-18-recovery.tar.gz` |
+| 异副本 | `E:\Desktop\omp-wb-incident-2026-10-18.tar.gz` |
+
+异副本的存在意义是：`E:\Desktop\OMP-WorkBuddy` 正是本次事故被整体清空过的路径，把唯一证据只放在那里等于重蹈覆辙。两份均**不应被 `git add`**（490KB 二进制，内含 `.git` 对象库，入历史即永久留痕）；`.gitignore` 已加入 `/_recovered/` 予以阻止。

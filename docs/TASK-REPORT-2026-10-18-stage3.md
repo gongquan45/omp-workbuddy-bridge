@@ -31,7 +31,7 @@ bun test    266 pass / 1 skip / 0 fail（267 项 / 11 文件 / 860 断言）
 | `06953e8` | test | 修测试命题漂移、清死代码 |
 | `2e7c32b` | feat | 阶段 1–3 契约、manifest 接口、迁移落地 |
 
-变更规模：**16 个文件，+3,087 / −381 行**。
+变更规模（`8d404e8..0a95ca9`，9 个提交）：**16 个文件，+3,102 / −381 行**。
 
 ---
 
@@ -86,7 +86,7 @@ merge 逻辑以 `delegatedWorkId` 为键，字段级合并 receipt 侧与 collab
 
 ## 三、验证方法：可证伪性
 
-本轮两条关键用例都做了**反向验证**——临时破坏被测逻辑，确认用例真的失败，再恢复：
+本轮三条关键用例都做了**反向验证**——临时破坏被测逻辑，确认用例真的失败，再恢复：
 
 | 用例 | 破坏方式 | 结果 |
 |---|---|---|
@@ -148,7 +148,7 @@ merge 逻辑以 `delegatedWorkId` 为键，字段级合并 receipt 侧与 collab
 
 **这点必须单独陈述**：`git status` 干净**不等于**文档齐全。这 5 份文档从未进入版本库，任何基于 `git clone` 的恢复都不会带上它们，而 `git status` 也不会报告它们缺失。
 
-**恢复后实测**：`267 pass / 1 skip / 0 fail`，与迁移前一致（新增一条大小写用例）。
+**恢复后实测**：`266 pass / 1 skip / 0 fail`（共 267 项），与迁移前一致（新增一条大小写用例）。
 
 ### 关于 `_recovered/` 的处理
 
@@ -247,7 +247,11 @@ mcp.ts     → 启动读 access；写工具拒绝未启用项目；context 可�
 ?? omp-wb-bridge-requirements-backup.md
 ```
 
-其中 `_recovered/` 与两个 `*-backup.md` 是事故残留（**未被 `.gitignore` 覆盖**，执行 `git add -A` 会把它们提交进主仓库，需注意）。它们未移出主树是用户的明确要求（"暂不清理"），不是遗漏。
+其中 `_recovered/` 与两个 `*-backup.md` 是事故残留，按用户要求保留在主树（"暂不清理"）。
+
+`.gitignore` 已加入三行（`/_recovered/`、`/memorix-report-backup.md`、`/omp-wb-bridge-requirements-backup.md`）阻止它们被 `git add -A` 卷入历史——其中 tarball 是 490KB 二进制且内含 `.git` 对象库，入历史即永久留痕。加规则后 `git status` 不再显示这三项。
+
+**`_recovered/incident-2026-10-18-recovery.tar.gz` 是事故唯一不可再生的证据**（内含 3 个仅本地提交与 52 个中间版本）。现有两份物理副本，SHA-256 相同（`a4ed14e5…`）：主副本在上述路径，异副本在 `E:\Desktop\omp-wb-incident-2026-10-18.tar.gz`。异副本必要，因为主副本所在目录正是本次事故被清空过的路径。
 
 ## 十、环境清理
 
@@ -258,6 +262,7 @@ mcp.ts     → 启动读 access；写工具拒绝未启用项目；context 可�
 
 保留：
 - `_recovered/incident-2026-10-18-recovery.tar.gz`（事故归档，含 `versions/` 52 个中间版本与 3 个仅本地提交）
+- `E:\Desktop\omp-wb-incident-2026-10-18.tar.gz`（上述归档的异副本，SHA-256 相同）
 - `E:\Desktop\wb-live-test`（事故报告 §3.3 引用的相邻工作区，含 WorkBuddy 真实产物与收据）
-- `_recovered/archive/`、两个 `*-backup.md`（用户要求暂不清理）
+- `_recovered/archive/`、两个 `*-backup.md`（用户要求暂不清理；已加入 `.gitignore`）
 - `%TEMP%` 下约 190 个 `wb-*` 历史测试残留目录（非本轮产生，未动）
