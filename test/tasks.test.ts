@@ -41,6 +41,7 @@ import {
 	readTaskIndex,
 	readTaskLock,
 	releaseTask,
+	resolveRoundPaths,
 	stageTask,
 	WbTaskError,
 	writeBinding,
@@ -1589,6 +1590,64 @@ describe("stageTask frozen snapshots", () => {
 		let caught: unknown = null;
 		try {
 			await stageTask(rootDir, confirmation, drifted, STAGE_TASK_ID, 1);
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught instanceof WbTaskError).toBeTrue();
+		if (caught instanceof WbTaskError) {
+			expect(caught.code).toBe(WB_ERROR_CODE.inputInvalid);
+		}
+	});
+});
+
+describe("resolveRoundPaths", () => {
+	const projectRoot = path.join("test-root", "project");
+	// A valid UUID: the resolver validates before composing a path (defense in depth).
+	const taskId = "11111111-1111-4111-8111-111111111111";
+
+	it("resolves round layout nested under rounds/<n>", () => {
+		const paths = resolveRoundPaths(projectRoot, taskId, 2, "round");
+		const expectedRoundDir = path.join(projectRoot, ".wb-bridge", "tasks", taskId, "rounds", "2");
+		expect(paths.roundDir).toBe(expectedRoundDir);
+		expect(paths.outputsDir.endsWith(path.join(".wb-bridge", "tasks", taskId, "rounds", "2", "outputs"))).toBeTrue();
+		expect(paths.inputsDir.endsWith(path.join(".wb-bridge", "tasks", taskId, "rounds", "2", "inputs"))).toBeTrue();
+		expect(paths.briefPath.endsWith(path.join(".wb-bridge", "tasks", taskId, "rounds", "2", "brief.md"))).toBeTrue();
+	});
+
+	it("resolves legacy layout directly under task directory", () => {
+		const paths = resolveRoundPaths(projectRoot, taskId, 1, "legacy");
+		const expectedTaskDir = path.join(projectRoot, ".wb-bridge", "tasks", taskId);
+		expect(paths.roundDir).toBe(expectedTaskDir);
+		expect(paths.outputsDir.endsWith(path.join(".wb-bridge", "tasks", taskId, "outputs"))).toBeTrue();
+	});
+
+	it("ensures round and legacy layouts never resolve to the same outputsDir", () => {
+		const roundPaths = resolveRoundPaths(projectRoot, taskId, 2, "round");
+		const legacyPaths = resolveRoundPaths(projectRoot, taskId, 2, "legacy");
+		expect(roundPaths.outputsDir).not.toBe(legacyPaths.outputsDir);
+	});
+});
+
+describe("resolveRoundPaths input validation", () => {
+	const projectRoot = path.join("test-root", "project");
+
+	it("rejects a non-UUID task id before composing a path", () => {
+		let caught: unknown = null;
+		try {
+			resolveRoundPaths(projectRoot, "task-regression-123", 1, "round");
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught instanceof WbTaskError).toBeTrue();
+		if (caught instanceof WbTaskError) {
+			expect(caught.code).toBe(WB_ERROR_CODE.inputInvalid);
+		}
+	});
+
+	it("rejects a non-positive round", () => {
+		let caught: unknown = null;
+		try {
+			resolveRoundPaths(projectRoot, "11111111-1111-4111-8111-111111111111", 0, "round");
 		} catch (err) {
 			caught = err;
 		}

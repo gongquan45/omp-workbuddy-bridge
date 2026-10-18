@@ -6,6 +6,8 @@ import { atomicWriteFile, tryCreateLockFile } from "./storage";
 import { isPidAlive, computeFileSha256, WbTaskError } from "./tasks";
 import type { FileArtifact, RemoteResult, WorkRecord, WorkReview } from "./types";
 import { WB_ERROR_CODE } from "./types";
+import { normalizeScopePath, pathsOverlap } from "./scope";
+export { normalizeScopePath, pathsOverlap } from "./scope";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -94,43 +96,6 @@ export interface ProjectContextResult {
 		latestReview: WorkReview | null;
 		reviewCount: number;
 	};
-}
-
-/**
- * Normalizes a scope path: converts backslashes to forward slashes,
- * strips leading/trailing slashes, and rejects '..' or absolute paths.
- */
-export function normalizeScopePath(raw: string): string {
-	if (typeof raw !== "string" || raw.trim().length === 0) {
-		throw new WbTaskError(WB_ERROR_CODE.inputInvalid, "Scope path must be a non-empty string");
-	}
-	if (path.isAbsolute(raw) || /^[a-zA-Z]:/.test(raw) || raw.startsWith("/") || raw.startsWith("\\")) {
-		throw new WbTaskError(WB_ERROR_CODE.inputInvalid, `Scope path must be relative: "${raw}"`);
-	}
-	const normalized = path.normalize(raw).split(path.sep).join("/");
-	const segments = normalized.split("/");
-	if (segments.some((seg) => seg === "..")) {
-		throw new WbTaskError(WB_ERROR_CODE.inputInvalid, `Scope path contains '..' traversal: "${raw}"`);
-	}
-	if (normalized === "." || normalized === "") {
-		throw new WbTaskError(WB_ERROR_CODE.inputInvalid, `Scope path cannot target the entire project root: "${raw}"`);
-	}
-	return normalized;
-}
-
-/**
- * Checks if two normalized paths overlap hierarchically (exact match, parent-child, or child-parent).
- */
-export function pathsOverlap(pathA: string, pathB: string): boolean {
-	const a = process.platform === "win32" ? pathA.toLowerCase() : pathA;
-	const b = process.platform === "win32" ? pathB.toLowerCase() : pathB;
-	if (a === b) {
-		return true;
-	}
-	if (a.startsWith(`${b}/`) || b.startsWith(`${a}/`)) {
-		return true;
-	}
-	return false;
 }
 
 /**
@@ -597,6 +562,56 @@ export async function claimWork(
 }
 
 /**
+ * Hardens review artifact validation: checks path normalization, existence,
+ * containment, regular file status, and recomputes the current hash so a review
+ * always describes the bytes that are actually on disk.
+ */
+async function verifyReviewArtifacts(
+	projectRoot: string,
+	artifacts: Array<{ path: string; sha256: string }> | undefined
+): Promise<void> {
+	if (!artifacts || artifacts.length === 0) {
+		return;
+	}
+	const root = await realpath(projectRoot);
+	for (const entry of artifacts) {
+		let rawPath = entry.path;
+		if (path.isAbsolute(rawPath)) {
+			const relToRoot = path.relative(root, rawPath);
+			if (!relToRoot.startsWith("..") && !path.isAbsolute(relToRoot)) {
+				rawPath = relToRoot;
+			}
+		}
+		const rel = normalizeScopePath(rawPath);
+		const absolute = path.join(root, ...rel.split("/"));
+		const fileReal = await realpath(absolute).catch(() => null);
+		if (fileReal === null) {
+			throw new WbTaskError(WB_ERROR_CODE.inputInvalid, `Review artifact "${entry.path}" does not exist`);
+		}
+		const relFromRoot = path.relative(root, fileReal);
+		if (relFromRoot.startsWith("..") || path.isAbsolute(relFromRoot) || relFromRoot === "") {
+			throw new WbTaskError(WB_ERROR_CODE.inputInvalid, `Review artifact "${entry.path}" escapes project root: "${relFromRoot}"`);
+		}
+		const st = await stat(fileReal);
+		if (!st.isFile()) {
+			throw new WbTaskError(WB_ERROR_CODE.inputInvalid, `Review artifact "${entry.path}" is not a regular file`);
+		}
+		const currentSha = await computeFileSha256(fileReal);
+		if (entry.sha256 !== currentSha) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.artifactChanged,
+				`Review artifact "${entry.path}" changed since it was reviewed (expected ${entry.sha256}, found ${currentSha})`
+			);
+		}
+		// The caller's hash must match the bytes on disk: that is the whole point
+		// of re-verifying (N02). Comparing against the artifact's *published* hash
+		// is deliberately NOT a rejection: a file that changed since publication is
+		// a legitimate re-review, and blocking it would make such an artifact
+		// permanently unacceptable because the published hash never changes.
+	}
+}
+
+/**
  * Publishes progress, files, remote results, reviews, or releases work.
  */
 export async function publishWork(
@@ -615,6 +630,7 @@ export async function publishWork(
 			if (request.review === undefined) {
 				throw new WbTaskError(WB_ERROR_CODE.taskNotFound, `Work record ${request.workId} not found`);
 			}
+			await verifyReviewArtifacts(canonicalRoot, request.review.artifacts);
 			const historicRecord: WorkRecord = {
 				version: 1,
 				workId: request.workId,
@@ -784,20 +800,39 @@ export async function publishWork(
 		// Process review
 		const updatedReviews = [...existing.reviews];
 		if (request.review) {
-			// Verify artifact hashes
-			for (const checkArt of request.review.artifacts) {
-				const found = updatedArtifacts.find((a) => a.path === checkArt.path);
-				if (!found) {
-					throw new WbTaskError(
-						WB_ERROR_CODE.artifactChanged,
-						`Reviewed artifact "${checkArt.path}" is not in published artifacts`
+			await verifyReviewArtifacts(canonicalRoot, request.review.artifacts);
+
+			// An accepted review makes the reviewed bytes the current truth, so the
+			// record's artifact hash must follow. Without this the record keeps
+			// claiming the first published hash forever and every later projection
+			// reports a stale mismatch against a file the human just accepted.
+			// `changes_requested` / `unverified` deliberately do NOT write back:
+			// their whole meaning is that the current bytes are not accepted.
+			if (request.review.verdict === "accepted") {
+				for (const reviewed of request.review.artifacts) {
+					const reviewedRel = normalizeScopePath(
+						path.isAbsolute(reviewed.path) ? path.relative(canonicalRoot, reviewed.path) : reviewed.path
 					);
-				}
-				if (found.sha256 !== checkArt.sha256) {
-					throw new WbTaskError(
-						WB_ERROR_CODE.artifactChanged,
-						`Artifact hash changed for "${checkArt.path}": expected ${checkArt.sha256}, got ${found.sha256}`
-					);
+					const target = updatedArtifacts.find((artifact) => {
+						const artifactRel = path.isAbsolute(artifact.path)
+							? path.relative(canonicalRoot, artifact.path).split(path.sep).join("/")
+							: artifact.path;
+						return artifactRel === reviewedRel;
+					});
+					if (target === undefined) {
+						// The file exists on disk but was never published for this work,
+						// so accepting it would bless a deliverable the record does not
+						// know about.
+						throw new WbTaskError(
+							WB_ERROR_CODE.artifactChanged,
+							`Review artifact "${reviewed.path}" is not a published artifact of ${existing.workId}`
+						);
+					}
+					target.sha256 = reviewed.sha256;
+					const stat2 = await stat(path.join(canonicalRoot, ...reviewedRel.split("/"))).catch(() => null);
+					if (stat2 !== null) {
+						target.bytes = stat2.size;
+					}
 				}
 			}
 

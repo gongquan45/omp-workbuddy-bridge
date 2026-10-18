@@ -253,63 +253,87 @@ export async function migrateProjectToQueue(root: string): Promise<string> {
 							],
 						);
 					}
-					// A legacy receipt-only task gets its historical work record so
-					// receipt-only and collaboration-linked projects merge uniformly.
-					const workId = delegatedWorkId(taskId, round.number);
-					db.run(
-						`INSERT OR IGNORE INTO works(work_id, revision, state, record_json, task_id, round)
-						 VALUES(?, ?, 'released', ?, ?, ?)`,
-						[
-							workId,
-							nextRevision(db),
-							JSON.stringify({
-								version: 1,
-								workId,
-								projectRoot: canonicalRoot,
-								owner: "omp",
-								source: "delegated",
-								taskId,
-								round: round.number,
-								nativeRef: null,
-								title: round.goal.objective.slice(0, 80),
-								scope: null,
-								state: "released",
-								phase: "history",
-								milestone: "",
-								blocker: "",
-								updatedAt: new Date(round.consent ? Date.parse(round.consent.at) || Date.now() : Date.now()).toISOString(),
-								revision: 1,
-								artifacts: [],
-								remoteResults: [],
-								reviews: [],
-							}),
-							taskId,
-							round.number,
-						],
-					);
 				}
 			}
 
-			// Collaboration records: imported with their real state, matching the
-			// same workId as a same-id receipt round where one exists.
+			// Collaboration records are the richer side: they carry revisions, reviews,
+			// nativeRef and the real scope. A receipt round contributes what the file
+			// side never knew (task identity, title, timestamp), so the merge below is a
+			// field-by-field union rather than "whoever inserted last wins".
+			const receiptWork = new Map<string, { title: string; taskId: string; round: number; at: number }>();
+			for (const { taskId, receipt } of receipts) {
+				for (const round of receipt.rounds) {
+					const parsed = round.consent ? Date.parse(round.consent.at) : Number.NaN;
+					receiptWork.set(delegatedWorkId(taskId, round.number), {
+						title: round.goal.objective.slice(0, 80),
+						taskId,
+						round: round.number,
+						at: Number.isFinite(parsed) && parsed > 0 ? parsed : Date.now(),
+					});
+				}
+			}
+
+			const merged = new Map<string, Record<string, unknown>>();
+			for (const [workId, meta] of receiptWork) {
+				merged.set(workId, {
+					version: 1,
+					workId,
+					projectRoot: canonicalRoot,
+					owner: "omp",
+					source: "delegated",
+					taskId: meta.taskId,
+					round: meta.round,
+					nativeRef: null,
+					title: meta.title,
+					scope: null,
+					state: "released",
+					phase: "history",
+					milestone: "",
+					blocker: "",
+					updatedAt: new Date(meta.at).toISOString(),
+					revision: 1,
+					artifacts: [],
+					remoteResults: [],
+					reviews: [],
+				});
+			}
+			// The collaboration side overlays: it owns the work's identity (owner,
+			// scope, state, revisions, reviews, nativeRef). Provenance fields fall back
+			// to the receipt side when the file record does not carry them.
 			for (const record of works) {
 				const round = record.round ?? 0;
 				const workId = record.taskId !== null ? delegatedWorkId(record.taskId, round) : record.workId;
+				const base = merged.get(workId);
+				merged.set(workId, {
+					...(base ?? {}),
+					...record,
+					workId,
+					taskId: record.taskId ?? (base?.taskId as string | undefined) ?? null,
+					round: record.round ?? (base?.round as number | undefined) ?? null,
+					title: record.title.length > 0 ? record.title : ((base?.title as string | undefined) ?? record.title),
+				});
+			}
+
+			for (const [workId, record] of merged) {
 				db.run(
 					`INSERT INTO works(work_id, revision, state, record_json, task_id, round)
 					 VALUES(?, ?, ?, ?, ?, ?)
-					 ON CONFLICT(work_id) DO UPDATE SET record_json = excluded.record_json, state = excluded.state`,
+					 ON CONFLICT(work_id) DO UPDATE SET
+						record_json = excluded.record_json,
+						state = excluded.state,
+						revision = excluded.revision,
+						task_id = excluded.task_id,
+						round = excluded.round`,
 					[
 						workId,
 						nextRevision(db),
-						record.state,
+						record.state as string,
 						JSON.stringify(record),
-						record.taskId,
-						record.round,
+						(record.taskId as string | null) ?? null,
+						(record.round as number | null) ?? null,
 					],
 				);
 			}
-
 			for (const failure of receiptFailures) {
 				recordIssue(db, "receipt_unreadable", `.wb-bridge/tasks/${failure.taskId}/receipt.json`, failure.detail);
 			}

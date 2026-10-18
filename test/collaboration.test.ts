@@ -15,6 +15,7 @@ import {
 } from "../src/collaboration";
 import { computeFileSha256, delegatedWorkId, WbTaskError } from "../src/tasks";
 import { WB_ERROR_CODE } from "../src/types";
+import { scopesConflict } from "../src/scope";
 
 const allocatedRoots: string[] = [];
 
@@ -639,6 +640,121 @@ describe("waiting work records", () => {
 		if (caught instanceof WbTaskError) {
 			expect(caught.code).toBe(WB_ERROR_CODE.inputInvalid);
 			expect(caught.message).toContain("waiting for its scope grant");
+		}
+	});
+});
+
+describe("scopesConflict domain rules", () => {
+	const empty = { readPaths: [], writePaths: [] };
+
+	it("treats write/write and write/read overlap as conflicting", () => {
+		expect(scopesConflict({ readPaths: [], writePaths: ["src/a.ts"] }, { readPaths: [], writePaths: ["src/a.ts"] })).toBeTrue();
+		expect(scopesConflict({ readPaths: [], writePaths: ["src/a.ts"] }, { readPaths: ["src"], writePaths: [] })).toBeTrue();
+	});
+
+	it("treats read/write overlap as conflicting but read/read as free", () => {
+		expect(scopesConflict({ readPaths: ["src/a.ts"], writePaths: [] }, { readPaths: [], writePaths: ["src"] })).toBeTrue();
+		expect(scopesConflict({ readPaths: ["src/a.ts"], writePaths: [] }, { readPaths: ["src/a.ts"], writePaths: [] })).toBeFalse();
+	});
+
+	it("treats disjoint scopes as free", () => {
+		expect(scopesConflict({ readPaths: [], writePaths: ["out/a"] }, { readPaths: [], writePaths: ["out/b"] })).toBeFalse();
+		expect(scopesConflict({ readPaths: [], writePaths: ["out/a"] }, empty)).toBeFalse();
+	});
+
+	it("fails closed when a stored path cannot be normalized", () => {
+		// A poisoned row (absolute, or traversal) must block rather than license
+		// concurrent writers: it is data written by an earlier version, so silence
+		// here would turn a corrupt record into an authorization bypass.
+		expect(scopesConflict({ readPaths: [], writePaths: ["out/a"] }, { readPaths: [], writePaths: ["C:/abs"] })).toBeTrue();
+		expect(scopesConflict({ readPaths: [], writePaths: ["out/a"] }, { readPaths: ["../escape"], writePaths: [] })).toBeTrue();
+	});
+
+	it("fails closed when a proposed path cannot be normalized", () => {
+		expect(scopesConflict({ readPaths: [], writePaths: ["../escape"] }, { readPaths: [], writePaths: ["out/a"] })).toBeTrue();
+	});
+
+	it("normalizes separators and case before comparing on win32", () => {
+		// Same logical path written two ways must conflict, not slip through.
+		expect(scopesConflict({ readPaths: [], writePaths: ["out/a.ts"] }, { readPaths: [], writePaths: ["out\\a.ts"] })).toBeTrue();
+	});
+});
+
+describe("review re-verifies bytes on disk (N02)", () => {
+	it("refuses an accepted review after the artifact changed on disk", async () => {
+		const root = await createProjectRoot();
+		const claim = await claimWork(root, "workbuddy", {
+			title: "Reviewed artifact",
+			scope: { readPaths: [], writePaths: [] },
+		});
+		// Publish one real deliverable into the round's outputs directory.
+		await mkdir(claim.outputsDir, { recursive: true });
+		const outPath = path.join(claim.outputsDir, "report.md");
+		await writeFile(outPath, "v1\n", "utf-8");
+		const published = await publishWork(root, "workbuddy", {
+			workId: claim.record.workId,
+			expectedRevision: 1,
+			files: [{ path: "report.md", role: "final" }],
+		});
+		const publishedSha = published.artifacts[0]?.sha256;
+		expect(publishedSha).not.toBeNull();
+
+		// The bytes change after publication: a review quoting the old hash must be
+		// refused, because the reviewer never saw this content.
+		await writeFile(outPath, "v2 tampered\n", "utf-8");
+		let caught: unknown = null;
+		try {
+			await publishWork(root, "workbuddy", {
+				workId: claim.record.workId,
+				expectedRevision: 2,
+				review: { round: null, artifacts: [{ path: outPath, sha256: publishedSha! }], verdict: "accepted", note: "ok" },
+			});
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught instanceof WbTaskError).toBeTrue();
+		if (caught instanceof WbTaskError) {
+			expect(caught.code).toBe(WB_ERROR_CODE.artifactChanged);
+		}
+
+		// A review quoting the hash that is actually on disk is accepted, proving
+		// the rejection above was about the bytes and not about reviews generally.
+		const currentSha = await computeFileSha256(outPath);
+		const accepted = await publishWork(root, "workbuddy", {
+			workId: claim.record.workId,
+			expectedRevision: 2,
+			review: { round: null, artifacts: [{ path: outPath, sha256: currentSha }], verdict: "accepted", note: "re-read" },
+		});
+		expect(accepted.reviews.length).toBe(1);
+		// The accepted review makes the new bytes the record's truth; without this
+		// write-back every later projection would flag a stale mismatch.
+		expect(accepted.artifacts[0]?.sha256).toBe(currentSha);
+	});
+
+	it("refuses a review that names a file which does not exist", async () => {
+		const root = await createProjectRoot();
+		const claim = await claimWork(root, "workbuddy", {
+			title: "Missing artifact",
+			scope: { readPaths: [], writePaths: [] },
+		});
+		let caught: unknown = null;
+		try {
+			await publishWork(root, "workbuddy", {
+				workId: claim.record.workId,
+				expectedRevision: 1,
+				review: {
+					round: null,
+					artifacts: [{ path: path.join(claim.outputsDir, "never-written.md"), sha256: "a".repeat(64) }],
+					verdict: "accepted",
+					note: "ok",
+				},
+			});
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught instanceof WbTaskError).toBeTrue();
+		if (caught instanceof WbTaskError) {
+			expect(caught.code).toBe(WB_ERROR_CODE.inputInvalid);
 		}
 	});
 });

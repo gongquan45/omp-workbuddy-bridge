@@ -13,7 +13,7 @@ import {
 } from "../src/queue";
 import { legacyRequestId, migrateProjectToQueue } from "../src/migration";
 import { atomicWriteFile } from "../src/storage";
-import { WbTaskError } from "../src/tasks";
+import { delegatedWorkId, WbTaskError } from "../src/tasks";
 import { WB_ERROR_CODE, type TaskReceipt } from "../src/types";
 
 let root = "";
@@ -295,5 +295,114 @@ describe("migration gating", () => {
 		const { readFile } = await import("node:fs/promises");
 		const content = await readFile(path.join(root, ".wb-bridge", "binding.json"), "utf-8");
 		expect(JSON.parse(content).sessionId).toBe(SESSION_A);
+	});
+});
+
+describe("works merge across receipt and collaboration sides", () => {
+	/** Writes one collaboration record into .wb-bridge/collaboration/. */
+	async function writeCollaborationRecord(workId: string, overrides: Record<string, unknown> = {}): Promise<void> {
+		const collabDir = path.join(root, ".wb-bridge", "collaboration");
+		await mkdir(collabDir, { recursive: true });
+		await atomicWriteFile(
+			collabDir,
+			path.join(collabDir, `${workId}.json`),
+			JSON.stringify(
+				{
+					version: 1,
+					workId,
+					projectRoot: root,
+					owner: "workbuddy",
+					source: "native",
+					taskId: null,
+					round: null,
+					nativeRef: { sessionId: SESSION_A, goalId: "goal-1" },
+					title: "Native collaboration work",
+					scope: { readPaths: ["src/a"], writePaths: ["src/a/out"] },
+					state: "active",
+					phase: "impl",
+					milestone: "half",
+					blocker: "",
+					updatedAt: new Date().toISOString(),
+					revision: 3,
+					artifacts: [],
+					remoteResults: [],
+					reviews: [],
+					...overrides,
+				},
+				null,
+				2,
+			),
+		);
+	}
+
+	function worksRow(workId: string): { state: string; record_json: string; task_id: string | null; round: number | null } | null {
+		const db = openWriteConnection(root);
+		return db.query("SELECT state, record_json, task_id, round FROM works WHERE work_id = ?").get(workId) as
+			| { state: string; record_json: string; task_id: string | null; round: number | null }
+			| null;
+	}
+
+	it("keeps a receipt-only round as released history", async () => {
+		await writeBinding([{ sessionId: SESSION_A, role: "default", isDefault: true }]);
+		await writeReceipt([completedRound()]);
+		await migrateProjectToQueue(root);
+
+		const row = worksRow(delegatedWorkId(TASK_ID, 1));
+		expect(row).not.toBeNull();
+		expect(row?.state).toBe("released");
+		const record = JSON.parse(row!.record_json) as Record<string, unknown>;
+		expect(record.title).toBe("old task");
+		expect(record.taskId).toBe(TASK_ID);
+		expect(record.round).toBe(1);
+	});
+
+	it("keeps a collaboration-only work with its own identity", async () => {
+		await writeBinding([{ sessionId: SESSION_A, role: "default", isDefault: true }]);
+		const nativeId = "44444444-4444-4444-8444-444444444444";
+		await writeCollaborationRecord(nativeId);
+		await migrateProjectToQueue(root);
+
+		const row = worksRow(nativeId);
+		expect(row).not.toBeNull();
+		// The collaboration side owns state and scope; nothing from a receipt exists.
+		expect(row?.state).toBe("active");
+		expect(row?.task_id).toBeNull();
+		const record = JSON.parse(row!.record_json) as Record<string, unknown>;
+		expect(record.nativeRef).toEqual({ sessionId: SESSION_A, goalId: "goal-1" });
+		expect(record.revision).toBe(3);
+	});
+
+	it("unions both sides of the same round without losing either", async () => {
+		await writeBinding([{ sessionId: SESSION_A, role: "default", isDefault: true }]);
+		await writeReceipt([completedRound()]);
+		const mergedId = delegatedWorkId(TASK_ID, 1);
+		// Same derived work id on both sides: the merge must be a field union.
+		await writeCollaborationRecord(mergedId, {
+			owner: "omp",
+			source: "delegated",
+			taskId: TASK_ID,
+			round: 1,
+			title: "",
+			state: "blocked",
+			reviews: [
+				{ reviewer: "omp", round: 1, artifacts: [], verdict: "unverified", note: "n", at: new Date().toISOString() },
+			],
+		});
+		await migrateProjectToQueue(root);
+
+		const row = worksRow(mergedId);
+		expect(row).not.toBeNull();
+		// Exactly one row: the two sources must not produce sibling records.
+		const db = openWriteConnection(root);
+		const count = db.query("SELECT COUNT(*) AS c FROM works WHERE task_id = ?").get(TASK_ID) as { c: number };
+		expect(count.c).toBe(1);
+		// Collaboration state wins; receipt provenance survives the overlay.
+		expect(row?.state).toBe("blocked");
+		const record = JSON.parse(row!.record_json) as Record<string, unknown>;
+		expect(record.taskId).toBe(TASK_ID);
+		expect(record.round).toBe(1);
+		expect(record.title).toBe("old task");
+		expect(Array.isArray(record.reviews)).toBeTrue();
+		expect((record.reviews as unknown[]).length).toBe(1);
 	});
 });

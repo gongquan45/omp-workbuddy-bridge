@@ -355,6 +355,20 @@ export function taskError(code: string, message: string): TaskError {
 	return { code, message };
 }
 
+/**
+ * Extension error signaling operational or validation failures.
+ * Callers branch on the machine-readable `code` property matching `WB_ERROR_CODE`.
+ */
+export class WbTaskError extends Error {
+	readonly code: string;
+
+	constructor(code: string, message: string) {
+		super(message);
+		this.name = "WbTaskError";
+		this.code = code;
+	}
+}
+
 // ---------------------------------------------------------------------------
 // v3 contracts (Stage 1–3 of the v2.1.0 rollout).
 //

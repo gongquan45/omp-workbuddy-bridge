@@ -16,6 +16,7 @@
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import * as path from "node:path";
+import { scopesConflict } from "./scope";
 import { delegatedWorkId, hashManifestPayload, WbTaskError } from "./tasks";
 import { WB_ERROR_CODE, type ManifestInput, type OwnerIdentity, type TaskManifestPayload } from "./types";
 
@@ -1054,26 +1055,7 @@ class WriteQueue implements ProjectQueue {
 					if (record.scope === null || row.work_id === delegatedWorkId(taskId, round)) {
 						return false;
 					}
-					// Read/read shares; any write against a read or write overlaps.
-					// Overlap is segment-hierarchical: a file inside a written
-					// directory conflicts with that write, matching the path
-					// normalization rules used everywhere else.
-					const overlaps = (a: string, b: string): boolean => {
-						if (a === b) {
-							return true;
-						}
-						const aDir = a.endsWith("/") ? a : `${a}/`;
-						const bDir = b.endsWith("/") ? b : `${b}/`;
-						return b.startsWith(aDir) || a.startsWith(bDir);
-					};
-					return (
-						scope.writePaths.some(
-							(w) =>
-								record.scope!.writePaths.some((ow) => overlaps(w, ow)) ||
-								record.scope!.readPaths.some((or) => overlaps(w, or)),
-						) ||
-						scope.readPaths.some((r) => record.scope!.writePaths.some((ow) => overlaps(r, ow)))
-					);
+					return scopesConflict(scope, record.scope);
 				});
 				if (conflicting !== undefined) {
 					firstWait ??= {

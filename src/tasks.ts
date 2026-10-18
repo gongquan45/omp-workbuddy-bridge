@@ -41,26 +41,13 @@ import type {
 	TaskRound,
 	TaskStatus,
 } from "./types";
-import { taskError, WB_ERROR_CODE } from "./types";
+import { taskError, WB_ERROR_CODE, WbTaskError } from "./types";
+export { WbTaskError };
 /**
  * Standard UUID format (8-4-4-4-12 hex). Used to validate task IDs before
  * touching the filesystem so arbitrary path traversal via taskId is impossible.
  */
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-/**
- * Extension error signaling operational or validation failures.
- * Callers branch on the machine-readable `code` property matching `WB_ERROR_CODE`.
- */
-export class WbTaskError extends Error {
-	readonly code: string;
-
-	constructor(code: string, message: string) {
-		super(message);
-		this.name = "WbTaskError";
-		this.code = code;
-	}
-}
 
 /**
  * Validates the in-memory or deserialized object shape of a Binding.
@@ -250,6 +237,50 @@ export async function computeFileSha256(filePath: string): Promise<string> {
 	stream.on("end", () => resolve(hash.digest("hex")));
 	stream.on("error", reject);
 	return promise;
+}
+
+/** Every on-disk directory one round owns, resolved from its layout. */
+export interface RoundPaths {
+	roundDir: string;
+	inputsDir: string;
+	outputsDir: string;
+	briefPath: string;
+}
+
+/**
+ * The single source of truth for where a round keeps its files.
+ *
+ * `legacy` receipts predate rounds and keep their inputs/outputs directly under
+ * the task directory; `round` receipts nest them under `rounds/<n>`. Every
+ * consumer (prompt rendering, staging, artifact collection) must resolve paths
+ * here, because a second implementation silently disagrees about where a
+ * deliverable lives and the only symptom is a round stuck on missing outputs.
+ */
+export function resolveRoundPaths(projectRoot: string, taskId: string, round: number, layout: "legacy" | "round"): RoundPaths {
+	// Defense in depth: callers already validate, but a task id reaches a
+	// filesystem path right here, so this is the last gate before traversal.
+	if (!UUID_PATTERN.test(taskId)) {
+		throw new WbTaskError(WB_ERROR_CODE.inputInvalid, `Task id "${taskId}" must be a valid UUID`);
+	}
+	if (!Number.isInteger(round) || round < 1) {
+		throw new WbTaskError(WB_ERROR_CODE.inputInvalid, `Round must be a positive integer, got: ${String(round)}`);
+	}
+	const taskDir = path.join(projectRoot, ".wb-bridge", "tasks", taskId);
+	if (layout === "legacy") {
+		return {
+			roundDir: taskDir,
+			inputsDir: path.join(taskDir, "inputs"),
+			outputsDir: path.join(taskDir, "outputs"),
+			briefPath: path.join(taskDir, "brief.md"),
+		};
+	}
+	const roundDir = path.join(taskDir, "rounds", String(round));
+	return {
+		roundDir,
+		inputsDir: path.join(roundDir, "inputs"),
+		outputsDir: path.join(roundDir, "outputs"),
+		briefPath: path.join(roundDir, "brief.md"),
+	};
 }
 
 export function renderTaskPrompt(
@@ -1359,9 +1390,7 @@ export async function prepareTask(
 	}
 
 	// 2. Validate expectedOutputs
-	const taskDir = path.join(root, ".wb-bridge", "tasks", taskId);
-	const roundDir = path.join(taskDir, "rounds", String(roundNumber));
-	const outputsDir = path.join(roundDir, "outputs");
+	const paths = resolveRoundPaths(root, taskId, roundNumber, "round");
 	const validatedOutputs: string[] = [];
 	if (request.expectedOutputs && request.expectedOutputs.length > 0) {
 		const seenOutputs = new Set<string>();
@@ -1393,8 +1422,8 @@ export async function prepareTask(
 				);
 			}
 
-			const resolvedOut = path.resolve(outputsDir, rawOut);
-			const relFromOutputs = path.relative(outputsDir, resolvedOut);
+			const resolvedOut = path.resolve(paths.outputsDir, rawOut);
+			const relFromOutputs = path.relative(paths.outputsDir, resolvedOut);
 			if (relFromOutputs.startsWith("..") || path.isAbsolute(relFromOutputs) || relFromOutputs === "") {
 				throw new WbTaskError(
 					WB_ERROR_CODE.inputInvalid,
@@ -1434,14 +1463,14 @@ export async function prepareTask(
 		}
 
 		// 4. Create round directories and copy input files
-		const inputsDir = path.join(roundDir, "inputs");
-		await mkdir(inputsDir, { recursive: true });
-		await mkdir(outputsDir, { recursive: true });
+		await mkdir(paths.roundDir, { recursive: true });
+		await mkdir(paths.inputsDir, { recursive: true });
+		await mkdir(paths.outputsDir, { recursive: true });
 
 		const roundInputs: InputSnapshot[] = [];
 		for (const inputRel of validatedInputs) {
 			const sourceFile = path.resolve(root, inputRel);
-			const targetFile = path.join(inputsDir, path.normalize(inputRel));
+			const targetFile = path.join(paths.inputsDir, path.normalize(inputRel));
 			await mkdir(path.dirname(targetFile), { recursive: true });
 			await copyFile(sourceFile, targetFile);
 			const fileHash = await computeFileSha256(targetFile);
@@ -1476,14 +1505,13 @@ export async function prepareTask(
 		const briefContent = renderTaskPrompt(request.goal, {
 			taskId,
 			round: roundNumber,
-			inputsDir,
-			outputsDir,
+			inputsDir: paths.inputsDir,
+			outputsDir: paths.outputsDir,
 			inputFiles: roundInputs,
 			expectedOutputs: validatedOutputs,
 		});
 
-		const briefPath = path.join(roundDir, "brief.md");
-		await writeFile(briefPath, briefContent, "utf-8");
+		await writeFile(paths.briefPath, briefContent, "utf-8");
 
 		// 6. Record receipt.json
 		const newRound: TaskRound = {
@@ -1522,8 +1550,8 @@ export async function prepareTask(
 		return {
 			receipt,
 			round: roundNumber,
-			briefPath: path.resolve(briefPath),
-			outputsDir: path.resolve(outputsDir),
+			briefPath: path.resolve(paths.briefPath),
+			outputsDir: path.resolve(paths.outputsDir),
 		};
 	} catch (err) {
 		try {
@@ -1550,10 +1578,8 @@ export async function collectArtifacts(
 ): Promise<{ artifacts: FileArtifact[]; missingOutputs: string[] }> {
 	const root = await realpath(receipt.projectRoot);
 	const current = currentRound(receipt);
-	const taskOutputsDir =
-		current.layout === "legacy"
-			? path.join(root, ".wb-bridge", "tasks", receipt.taskId, "outputs")
-			: path.join(root, ".wb-bridge", "tasks", receipt.taskId, "rounds", String(current.number), "outputs");
+	const paths = resolveRoundPaths(root, receipt.taskId, current.number, current.layout);
+	const taskOutputsDir = paths.outputsDir;
 
 	let outputsReal: string;
 	try {
@@ -2003,7 +2029,7 @@ export async function stageTask(
 	}
 
 	// 5. Build payload via buildTaskManifestPayload with validatedOutputPaths
-	const outputsDir = path.join(canonicalRoot, ".wb-bridge", "tasks", taskId, "rounds", String(round), "outputs");
+	const outputsDir = resolveRoundPaths(canonicalRoot, taskId, round, "round").outputsDir;
 	const expectedOutputs = validatedOutputPaths(request.expectedOutputs, outputsDir);
 
 	const initialManifestInputs: ManifestInput[] = verifiedSources.map((s) => ({
