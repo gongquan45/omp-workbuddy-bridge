@@ -5,16 +5,26 @@
  * place rather than being restated per module.
  */
 
+/** One bound WorkBuddy session within a project's session pool. */
+export interface BoundSession {
+	sessionId: string;
+	role?: string;
+	title?: string;
+	isDefault?: boolean;
+}
+
 /** Stable identity of the WorkBuddy session a project delegates to. */
 export interface Binding {
 	/** Schema revision of this record. */
-	version: 1;
+	version: 1 | 2;
 	/** Absolute realpath of the project this binding belongs to. */
 	projectRoot: string;
 	/** WorkBuddy session UUID owned by the dedicated delegation session. */
 	sessionId: string;
 	/** WorkBuddy version observed when the binding was created. */
 	workbuddyVersion: string;
+	/** Session pool roster for multi-session support. */
+	sessions?: BoundSession[];
 }
 
 /** Lifecycle state of one delegated task. */
@@ -195,7 +205,11 @@ export interface WorkRecord {
 	nativeRef: { sessionId: string; goalId: string | null } | null;
 	title: string;
 	scope: { readPaths: string[]; writePaths: string[] } | null;
-	state: "active" | "blocked" | "released";
+	/**
+	 * `waiting` is a published but not-yet-granted scope: visible in lists, never
+	 * blocking. Only `active` and `blocked` participate in occupancy checks.
+	 */
+	state: "waiting" | "active" | "blocked" | "released";
 	phase: string;
 	milestone: string;
 	blocker: string;
@@ -326,9 +340,257 @@ export const WB_ERROR_CODE = {
 	revisionConflict: "WB_REVISION_CONFLICT",
 	/** An artifact's content hash changed since inspection or publication. */
 	artifactChanged: "WB_ARTIFACT_CHANGED",
+	/** Every queue arbitration retry lost to a concurrent writer's transaction. */
+	queueBusy: "WB_QUEUE_BUSY",
+	/** Old file-based state must be migrated before this project can dispatch. */
+	migrationRequired: "WB_MIGRATION_REQUIRED",
+	/** The OMP owner that holds a record is no longer the live generation. */
+	ownerUnavailable: "WB_OWNER_UNAVAILABLE",
+	/** A managed file could not be put into its intended state. */
+	integrationIncomplete: "WB_INTEGRATION_INCOMPLETE",
 } as const;
 
 /** Builds a {@link TaskError} without restating the shape at each call site. */
 export function taskError(code: string, message: string): TaskError {
 	return { code, message };
+}
+
+// ---------------------------------------------------------------------------
+// v3 contracts (Stage 1–3 of the v2.1.0 rollout).
+//
+// The v2 runtime keeps the original names; stage 4 swaps these over and drops
+// the suffix in one cutover.
+// ---------------------------------------------------------------------------
+
+/** Lifecycle state of one delegated task under the persistent-queue model. */
+export type TaskStatusV3 =
+	| "queued"
+	| "running"
+	| "awaiting_approval"
+	| "awaiting_help"
+	| "completed"
+	| "failed"
+	| "cancelled"
+	| "interrupted";
+
+/**
+ * Why a task is waiting, derivable from queue state rather than guessed.
+ *
+ * `programming_help` covers both an open help request and a confirmed
+ * continuation that has not resumed the parent work yet.
+ */
+export type WaitReason =
+	| "session_busy"
+	| "scope_conflict"
+	| "session_unavailable"
+	| "owner_unavailable"
+	| "programming_help"
+	| "native_state_unknown";
+
+/**
+ * Where a round may execute.
+ *
+ * A user-picked session — and every supplemental round — pins one WorkBuddy
+ * session; a pool confirmation delegates the choice to dispatch and lets
+ * later-verified sessions join the work.
+ */
+export type TargetPolicy =
+	| { kind: "session"; sessionId: string }
+	| { kind: "workspace_pool"; role: string | null };
+
+/** Immutable identity of one bridge activation inside one OMP session. */
+export interface OwnerIdentity {
+	/** OMP session id from `ctx.sessionManager.getSessionId()`. */
+	sessionId: string;
+	/** New UUID per session switch; fencing compares generations, not names. */
+	generation: string;
+	processId: number;
+	/** UUID generated once per activation instance. */
+	instanceId: string;
+}
+
+/** Fine-grained lifecycle phase; terminal status lives in {@link TaskStatusV3}. */
+export type TaskPhase =
+	| "queued"
+	| "preparing"
+	| "running"
+	| "awaiting_approval"
+	| "awaiting_help"
+	| "committing"
+	| "terminal"
+	| "recovery_required";
+
+/** Whether the two-phase terminal commit has landed for the current round. */
+export type CommitState = "pending" | "committed" | "failed";
+
+/** Current acceptance standing; historical reviews are kept separately. */
+export type ReviewState = "pending" | "accepted" | "changes_requested" | "unverified";
+
+/** How the user wants to receive progress: blocking the tool call or not. */
+export type DeliveryMode = "foreground" | "background";
+
+/** One armed prompt attempt recorded on a round. */
+export interface TurnAttemptV3 {
+	attemptId: string;
+	kind: "primary" | "help_resume";
+	/** SHA-256 of the exact prompt bytes; arm before send, never rewritten. */
+	promptSha256: string;
+	/** ISO timestamp of the confirmation that armed this attempt. */
+	consentAt: string;
+	stopReason: string | null;
+}
+
+/** Fence that ties a written receipt to the terminal DB commit. */
+export interface CommitTokenV3 {
+	requestId: string;
+	resultRevision: number;
+}
+
+/**
+ * One round of a v3 receipt.
+ *
+ * `turns` records only attempts that were actually armed; a cancellation
+ * between approval and send legitimately leaves `[]`. `legacy` rounds keep
+ * unknown evidence as `null`/`[]` — never a fabricated approval.
+ */
+export interface TaskRoundV3 {
+	number: number;
+	layout: "legacy" | "round";
+	goal: TaskGoal;
+	inputFiles: InputSnapshot[];
+	expectedOutputs: string[];
+	status: TaskStatusV3;
+	summary: string;
+	error: TaskError | null;
+	artifacts: FileArtifact[];
+	recordKind: "approved" | "legacy";
+	requestId: string;
+	targetPolicy: TargetPolicy;
+	/** Root of the frozen input snapshot: the directory containing `inputs/`. */
+	snapshotRoot: string;
+	owner: OwnerIdentity | null;
+	manifestSha256: string | null;
+	commitToken: CommitTokenV3 | null;
+	turns: TurnAttemptV3[];
+	consent: {
+		source: "host_dialog" | "user_command";
+		at: string;
+	} | null;
+}
+
+/**
+ * Durable record of one delegated task under the queue model.
+ *
+ * Receipts stay ordinary files; the database row carries the same evidence and
+ * the migration parser is the only writer of `legacy` rounds.
+ */
+export interface TaskReceiptV3 {
+	version: 3;
+	taskId: string;
+	/** Owning OMP session id, or `null` for legacy/imported rounds. */
+	sessionId: string | null;
+	projectRoot: string;
+	rounds: TaskRoundV3[];
+}
+
+/** Explicit human confirmation authorizing a round under the queue model. */
+export interface RoundConfirmationV3 {
+	source: "host_dialog" | "user_command";
+	at: string;
+	/** Supersedes the v2 single `sessionId`: pool confirmations are allowed. */
+	targetPolicy: TargetPolicy;
+	/** Unique request this confirmation belongs to; staging keys off it. */
+	requestId: string;
+	/**
+	 * SHA-256 of the manifest payload the human confirmed, computed by
+	 * `buildTaskManifestPayload` + `hashManifestPayload` before the dialog so
+	 * `stageTask` can verify the staged copies against exactly that digest.
+	 */
+	manifestSha256: string;
+	owner: OwnerIdentity;
+	previousRound: number;
+	inputs: { path: string; sha256: string }[];
+	/** User-selected delivery preference for this round; runtime may change it. */
+	deliveryMode: DeliveryMode;
+}
+
+/**
+ * Public view of one delegated task under the queue model.
+ *
+ * Terminal status, the commit pipeline and the current effective review are
+ * three different facts and are never folded into one field.
+ */
+export interface TaskViewV3 {
+	taskId: string;
+	/** Owning OMP session id when known; legacy/imported rounds are `null`. */
+	sessionId: string | null;
+	round: number;
+	status: TaskStatusV3;
+	phase: TaskPhase;
+	summary: string;
+	artifacts: FileArtifact[];
+	error: TaskError | null;
+	progress: string;
+	awaitingApproval: boolean;
+	ownedByCurrentProcess: boolean;
+	/** Why the task is waiting; `null` when it is executing or terminal. */
+	waitReason: WaitReason | null;
+	/** Queue/hold record ids backing `waitReason`. */
+	blockerIds: string[];
+	requestId: string;
+	commitState: CommitState;
+	reviewState: ReviewState;
+	/** Why the current files no longer match the accepted review, if so. */
+	reviewInvalidationReason: "artifact_changed" | "artifact_missing" | null;
+	/** True only for `completed` rounds whose commit is `committed`. */
+	readyForReview: boolean;
+	/** Set when the terminal state could not be committed to disk. */
+	storageError: TaskError | null;
+}
+
+/** One frozen input file inside a manifest payload. */
+export interface ManifestInput {
+	/** Original project-relative path of the source file. */
+	path: string;
+	/** Snapshot path relative to the stage root (never absolute, never hashed). */
+	snapshotPath: string;
+	bytes: number;
+	sha256: string;
+}
+
+/** The digest-bearing half of a stage manifest; this object alone is hashed. */
+export interface TaskManifestPayload {
+	version: 1;
+	projectRoot: string;
+	requestId: string;
+	taskId: string;
+	round: number;
+	owner: OwnerIdentity;
+	goal: TaskGoal;
+	targetPolicy: TargetPolicy;
+	expectedOutputs: string[];
+	/** Sorted by canonical relative path; the sort order is part of the digest. */
+	inputs: ManifestInput[];
+	deliveryMode: DeliveryMode;
+}
+
+/** Who approved the payload; excluded from the payload digest itself. */
+export interface ManifestApproval {
+	source: "host_dialog" | "user_command";
+	at: string;
+	payloadSha256: string;
+}
+
+/** Result of staging one frozen input snapshot for a round. */
+export interface StagedTask {
+	/** Directory containing `inputs/`; recorded on the round, never hashed. */
+	snapshotRoot: string;
+	/** Absolute path to `manifest.json` inside the stage. */
+	manifestPath: string;
+	/** SHA-256 of the canonical manifest payload, equal to the confirmed value. */
+	manifestSha256: string;
+	manifest: {
+		payload: TaskManifestPayload;
+		approval: ManifestApproval;
+	};
 }

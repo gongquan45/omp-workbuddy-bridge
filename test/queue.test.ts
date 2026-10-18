@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -17,12 +17,16 @@ import {
 	type ApprovedEnqueue,
 	type ClaimOutcome,
 } from "../src/queue";
-import { WB_ERROR_CODE } from "../src/types";
+import {
+	buildTaskManifestPayload,
+	hashManifestPayload,
+	stageTask,
+} from "../src/tasks";
+import { WB_ERROR_CODE, type RoundConfirmationV3, type TaskRequest } from "../src/types";
 
 let root = "";
 /** Set only once a fixture root exists; guards the cleanup below. */
 let rootReady = false;
-const openConnections: string[] = [];
 
 beforeEach(async () => {
 	root = await realpath(await mkdtemp(path.join(tmpdir(), "wb-queue-")));
@@ -30,8 +34,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-	// Guard against a setup failure leaving root unset: rm("") would
-	// resolve against the process cwd, which for bun test is this repository.
+	// Guard against a setup failure leaving root unset: rm("") would resolve
+	// against the process cwd, which for bun test is this repository.
 	if (!rootReady || !path.isAbsolute(root) || root.length < 8) {
 		return;
 	}
@@ -43,8 +47,10 @@ afterEach(async () => {
 
 const TASK_A = "11111111-1111-4111-8111-111111111111";
 const TASK_B = "33333333-3333-4333-8333-333333333333";
+const TASK_C = "55555555-5555-4555-8555-555555555555";
 const REQUEST_A = "22222222-2222-4222-8222-222222222222";
 const REQUEST_B = "44444444-4444-4444-8444-444444444444";
+const REQUEST_C = "66666666-6666-4666-8666-666666666666";
 
 function owner(overrides: Partial<{ sessionId: string; generation: string; processId: number; instanceId: string }> = {}) {
 	return {
@@ -56,29 +62,100 @@ function owner(overrides: Partial<{ sessionId: string; generation: string; proce
 	};
 }
 
-function enqueueInput(overrides: Partial<ApprovedEnqueue> = {}): ApprovedEnqueue {
+function testRequest(overrides: Partial<TaskRequest> = {}): TaskRequest {
 	return {
-		taskId: TASK_A,
-		round: 1,
-		requestId: REQUEST_A,
-		manifestSha256: "a".repeat(64),
-		manifestPath: path.join(root, "stage-a", "manifest.json"),
-		snapshotRoot: path.join(root, "stage-a"),
-		expectedPreviousRound: null,
-		readPaths: ["input.txt"],
-		writePaths: [".wb-bridge/tasks/11111111-1111-4111-8111-111111111111/rounds/1/outputs"],
-		targetPolicy: { kind: "session", sessionId: "wb-session-1" },
-		ownerSession: "omp-session-1",
-		ownerGeneration: "gen-1",
-		executorInstanceId: "instance-1",
-		approval: { source: "host_dialog", at: new Date().toISOString(), payloadSha256: "a".repeat(64) },
-		title: "Task A",
-		deliveryMode: "foreground",
+		goal: {
+			objective: "stage a frozen snapshot",
+			context: "",
+			constraints: [],
+			acceptance: ["outputs exist"],
+			externalActions: [],
+		},
+		inputFiles: ["input.txt"],
+		expectedOutputs: ["result.txt"],
 		...overrides,
 	};
 }
 
-/** Prepares the project: schema, enabled meta and a registered owner. */
+/**
+ * Stages a real frozen snapshot through the production path: writes the source
+ * input files, derives the manifest payload, and runs `stageTask`. Returns the
+ * enqueue input plus the confirmation the caller can reuse for a same-digest
+ * re-submission.
+ */
+async function stageRealSnapshot(options: {
+	taskId: string;
+	round: number;
+	requestId: string;
+	sourceContent?: string;
+	inputRel?: string;
+	targetSessionId?: string;
+	/** Extra confirmed read paths (e.g. another task's outputs dir). */
+	extraReadPaths?: string[];
+}): Promise<{ input: ApprovedEnqueue; confirmation: RoundConfirmationV3 }> {
+	const inputRel = options.inputRel ?? "input.txt";
+	const targetSessionId = options.targetSessionId ?? "wb-session-1";
+	const sourcePath = path.join(root, inputRel);
+	await mkdir(path.dirname(sourcePath), { recursive: true });
+	const content = options.sourceContent ?? "frozen bytes\n";
+	await writeFile(sourcePath, content, "utf-8");
+
+	const { computeFileSha256 } = await import("../src/tasks");
+	const sourceSha = await computeFileSha256(sourcePath);
+	const projectOwner = owner();
+	const payload = buildTaskManifestPayload({
+		projectRoot: root,
+		requestId: options.requestId,
+		taskId: options.taskId,
+		round: options.round,
+		owner: projectOwner,
+		goal: testRequest().goal,
+		targetPolicy: { kind: "session", sessionId: targetSessionId },
+		expectedOutputs: ["result.txt"],
+		inputs: [{ path: inputRel, snapshotPath: `inputs/${inputRel}`, bytes: Buffer.byteLength(content), sha256: sourceSha }],
+		deliveryMode: "foreground",
+	});
+	const confirmation: RoundConfirmationV3 = {
+		source: "host_dialog",
+		at: new Date().toISOString(),
+		targetPolicy: { kind: "session", sessionId: targetSessionId },
+		requestId: options.requestId,
+		manifestSha256: hashManifestPayload(payload),
+		owner: projectOwner,
+		previousRound: 0,
+		inputs: [{ path: inputRel, sha256: sourceSha }],
+		deliveryMode: "foreground",
+	};
+	const staged = await stageTask(
+		root,
+		confirmation,
+		testRequest({ inputFiles: [inputRel] }),
+		options.taskId,
+		options.round,
+	);
+	return {
+		input: {
+			taskId: options.taskId,
+			round: options.round,
+			requestId: options.requestId,
+			manifestSha256: staged.manifestSha256,
+			manifestPath: staged.manifestPath,
+			snapshotRoot: staged.snapshotRoot,
+			expectedPreviousRound: null,
+			readPaths: [inputRel],
+			writePaths: [`.wb-bridge/tasks/${options.taskId}/rounds/${options.round}/outputs`],
+			targetPolicy: { kind: "session", sessionId: targetSessionId },
+			ownerSession: projectOwner.sessionId,
+			ownerGeneration: projectOwner.generation,
+			executorInstanceId: projectOwner.instanceId,
+			approval: { source: "host_dialog", at: confirmation.at, payloadSha256: staged.manifestSha256 },
+			title: `Task ${options.taskId.slice(0, 4)}`,
+			deliveryMode: "foreground",
+		},
+		confirmation,
+	};
+}
+
 function prepareProject(projectOwner = owner()): void {
 	const queue = openProjectQueue(root, { mode: "write" });
 	expect(queue).not.toBeNull();
@@ -91,10 +168,11 @@ function prepareProject(projectOwner = owner()): void {
 }
 
 describe("project queue - authorization and owner gates", () => {
-	it("refuses enqueue with WB_MIGRATION_REQUIRED while the project is not enabled", () => {
+	it("refuses enqueue with WB_MIGRATION_REQUIRED while the project is not enabled", async () => {
+		const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
 		const queue = openProjectQueue(root, { mode: "write" })!;
 		try {
-			queue.enqueue(enqueueInput());
+			queue.enqueue(input);
 			throw new Error("enqueue should have failed");
 		} catch (err: unknown) {
 			expect((err as { code?: string }).code).toBe(WB_ERROR_CODE.migrationRequired);
@@ -103,12 +181,13 @@ describe("project queue - authorization and owner gates", () => {
 		}
 	});
 
-	it("refuses enqueue with WB_OWNER_UNAVAILABLE when the owner row is not registered", () => {
+	it("refuses enqueue with WB_OWNER_UNAVAILABLE when the owner row is not registered", async () => {
+		const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
 		const queue = openProjectQueue(root, { mode: "write" })!;
 		try {
 			const db = openWriteConnection(root);
 			withImmediate(db, () => writeMeta(db, "project_enabled_at", new Date().toISOString()));
-			queue.enqueue(enqueueInput());
+			queue.enqueue(input);
 			throw new Error("enqueue should have failed");
 		} catch (err: unknown) {
 			expect((err as { code?: string }).code).toBe(WB_ERROR_CODE.ownerUnavailable);
@@ -117,14 +196,15 @@ describe("project queue - authorization and owner gates", () => {
 		}
 	});
 
-	it("refuses enqueue from an owner whose generation was retired", () => {
+	it("refuses enqueue from an owner whose generation was retired", async () => {
 		prepareProject();
+		const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
 		const queue = openProjectQueue(root, { mode: "write" })!;
 		try {
 			const db = openWriteConnection(root);
 			withImmediate(db, () => retireOwner(db, owner()));
 			expect(isOwnerActive(openWriteConnection(root), owner())).toBeFalse();
-			queue.enqueue(enqueueInput());
+			queue.enqueue(input);
 			throw new Error("enqueue should have failed");
 		} catch (err: unknown) {
 			expect((err as { code?: string }).code).toBe(WB_ERROR_CODE.ownerUnavailable);
@@ -135,12 +215,13 @@ describe("project queue - authorization and owner gates", () => {
 });
 
 describe("project queue - enqueue idempotency", () => {
-	it("returns the original row for the same requestId and digest, leaving one round", () => {
+	it("returns the original row for the same requestId and digest, leaving one round", async () => {
 		prepareProject();
+		const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
 		const queue = openProjectQueue(root, { mode: "write" })!;
 		try {
-			const first = queue.enqueue(enqueueInput());
-			const second = queue.enqueue(enqueueInput());
+			const first = queue.enqueue(input);
+			const second = queue.enqueue(input);
 			expect(second.taskId).toBe(first.taskId);
 			expect(second.revision).toBe(first.revision);
 			const snapshot = queue.inspect({ taskId: TASK_A });
@@ -150,48 +231,58 @@ describe("project queue - enqueue idempotency", () => {
 		}
 	});
 
-	it("rejects the same requestId with a different digest via WB_REVISION_CONFLICT", () => {
+	it("rejects the same requestId with a different digest via WB_REVISION_CONFLICT", async () => {
 		prepareProject();
+		const { input, confirmation } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
 		const queue = openProjectQueue(root, { mode: "write" })!;
 		try {
-			queue.enqueue(enqueueInput());
-			expect(() => queue.enqueue(enqueueInput({ manifestSha256: "b".repeat(64) }))).toThrow(
-				/WB_REVISION_CONFLICT|different manifest digest/,
-			);
+			queue.enqueue(input);
+			// A different digest from the same request id: stage a second snapshot
+			// with different source content so the payload digest differs.
+			const { input: divergent } = await stageRealSnapshot({
+				taskId: TASK_A,
+				round: 1,
+				requestId: REQUEST_A,
+				sourceContent: "different bytes\n",
+			});
+			// The divergent stage legitimately hashes differently; the digest
+			// carried in its confirmation is the one enqueue must reject.
+			expect(divergent.manifestSha256).not.toBe(confirmation.manifestSha256);
+			expect(() => queue.enqueue(divergent)).toThrow(/WB_REVISION_CONFLICT|different manifest digest/);
 			// The losing write must not have touched the original row.
 			const snapshot = queue.inspect({ taskId: TASK_A });
 			expect(snapshot.tasks).toHaveLength(1);
-			expect(snapshot.tasks[0]?.manifest_sha256).toBe("a".repeat(64));
+			expect(snapshot.tasks[0]?.manifest_sha256).toBe(confirmation.manifestSha256);
 		} finally {
 			queue.close();
 		}
 	});
 
-	it("requires the previous round to be committed for a supplemental round", () => {
+	it("requires the previous round to be committed for a supplemental round", async () => {
 		prepareProject();
+		const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
 		const queue = openProjectQueue(root, { mode: "write" })!;
 		try {
-			queue.enqueue(enqueueInput());
+			queue.enqueue(input);
+			const { input: supplemental } = await stageRealSnapshot({
+				taskId: TASK_A,
+				round: 2,
+				requestId: REQUEST_B,
+			});
 			expect(() =>
-				queue.enqueue(
-					enqueueInput({
-						taskId: TASK_A,
-						round: 2,
-						requestId: REQUEST_B,
-						expectedPreviousRound: 1,
-					}),
-				),
+				queue.enqueue({ ...supplemental, expectedPreviousRound: 1 }),
 			).toThrow(/committed/);
 		} finally {
 			queue.close();
 		}
 	});
 
-	it("accepts a supplemental round once the previous round is committed", () => {
+	it("accepts a supplemental round once the previous round is committed", async () => {
 		prepareProject();
+		const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
 		const queue = openProjectQueue(root, { mode: "write" })!;
 		try {
-			queue.enqueue(enqueueInput());
+			queue.enqueue(input);
 			const db = openWriteConnection(root);
 			withImmediate(db, () => {
 				db.run(
@@ -199,10 +290,13 @@ describe("project queue - enqueue idempotency", () => {
 					[TASK_A],
 				);
 			});
-			const supplemental = queue.enqueue(
-				enqueueInput({ taskId: TASK_A, round: 2, requestId: REQUEST_B, expectedPreviousRound: 1 }),
-			);
-			expect(supplemental.round).toBe(2);
+			const { input: supplemental } = await stageRealSnapshot({
+				taskId: TASK_A,
+				round: 2,
+				requestId: REQUEST_B,
+			});
+			const accepted = queue.enqueue({ ...supplemental, expectedPreviousRound: 1 });
+			expect(accepted.round).toBe(2);
 		} finally {
 			queue.close();
 		}
@@ -210,11 +304,12 @@ describe("project queue - enqueue idempotency", () => {
 });
 
 describe("project queue - waiting work records", () => {
-	it("records a waiting scope without a hold: queued work never occupies", () => {
+	it("records a waiting scope without a hold: queued work never occupies", async () => {
 		prepareProject();
+		const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
 		const queue = openProjectQueue(root, { mode: "write" })!;
 		try {
-			queue.enqueue(enqueueInput());
+			queue.enqueue(input);
 			const snapshot = queue.inspect({ include: { works: true } });
 			expect(snapshot.works).toHaveLength(1);
 			expect(snapshot.works[0]?.state).toBe("waiting");
@@ -225,34 +320,61 @@ describe("project queue - waiting work records", () => {
 			queue.close();
 		}
 	});
+
+	it("persists the staged manifest's per-file input rows", async () => {
+		prepareProject();
+		const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
+		const queue = openProjectQueue(root, { mode: "write" })!;
+		try {
+			queue.enqueue(input);
+			const db = openWriteConnection(root);
+			const rows = db.query("SELECT * FROM inputs WHERE task_id = ?").all(TASK_A) as Array<{
+				path: string;
+				snapshot_path: string;
+				sha256: string;
+				bytes: number;
+			}>;
+			expect(rows).toHaveLength(1);
+			expect(rows[0]?.path).toBe("input.txt");
+			expect(rows[0]?.snapshot_path).toBe("inputs/input.txt");
+			expect(rows[0]?.sha256).toMatch(/^[0-9a-f]{64}$/);
+			expect(rows[0]?.bytes).toBe("frozen bytes\n".length);
+		} finally {
+			queue.close();
+		}
+	});
 });
 
 describe("project queue - claim arbitration", () => {
-	it("claims the oldest queued round and moves phase to preparing while status stays queued", () => {
+	it("claims the oldest queued round and moves phase to preparing while status stays queued", async () => {
 		prepareProject();
+		const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
 		const queue = openProjectQueue(root, { mode: "write" })!;
 		try {
-			queue.enqueue(enqueueInput());
+			queue.enqueue(input);
 			const claim = queue.claim(owner(), Date.now());
 			expect(claim.kind).toBe("claimed");
 			if (claim.kind === "claimed") {
 				expect(claim.taskId).toBe(TASK_A);
+				expect(claim.sessionId).toBe("wb-session-1");
 				expect(claim.attemptId).toMatch(/^[0-9a-f-]{36}$/);
 			}
 			const row = queue.inspect({ taskId: TASK_A }).tasks[0];
 			expect(row?.status).toBe("queued");
 			expect(row?.phase).toBe("preparing");
 			expect(row?.dispatch_state).toBe("not_sent");
+			expect(row?.selected_session).toBe("wb-session-1");
 		} finally {
 			queue.close();
 		}
 	});
 
-	it("creates one execution hold and promotes the waiting scope to active on claim", () => {
+	it("creates one execution hold and promotes the waiting scope to active on claim", async () => {
 		prepareProject();
+		const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
 		const queue = openProjectQueue(root, { mode: "write" })!;
 		try {
-			queue.enqueue(enqueueInput());
+			queue.enqueue(input);
 			queue.claim(owner(), Date.now());
 			const snapshot = queue.inspect({ include: { works: true } });
 			expect(snapshot.works[0]?.state).toBe("active");
@@ -264,62 +386,156 @@ describe("project queue - claim arbitration", () => {
 		}
 	});
 
-	it("makes a second round for the same WorkBuddy session wait with session_busy", () => {
+	it("makes a second round for the same WorkBuddy session wait with session_busy", async () => {
 		prepareProject();
 		const queue = openProjectQueue(root, { mode: "write" })!;
 		try {
-			// Task A targets wb-session-1; task B also targets wb-session-1 but is
-			// owned by a different OMP owner so it is a separate candidate.
+			// Task A and task B both target wb-session-1 but have disjoint scopes
+			// and different OMP owners, so only the session hold can explain a wait.
 			const otherOwner = owner({ sessionId: "omp-session-2", generation: "gen-2", instanceId: "instance-2" });
 			const db = openWriteConnection(root);
 			withImmediate(db, () => registerOwner(db, otherOwner, Date.now()));
-			queue.enqueue(enqueueInput());
-			queue.enqueue(
-				enqueueInput({
-					taskId: TASK_B,
-					requestId: REQUEST_B,
-					ownerSession: otherOwner.sessionId,
-					ownerGeneration: otherOwner.generation,
-					executorInstanceId: otherOwner.instanceId,
-				}),
-			);
+			const first = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
+			queue.enqueue(first.input);
+			const secondStage = await stageRealSnapshot({
+				taskId: TASK_B,
+				round: 1,
+				requestId: REQUEST_B,
+				inputRel: "other-input.txt",
+			});
+			queue.enqueue({
+				...secondStage.input,
+				ownerSession: otherOwner.sessionId,
+				ownerGeneration: otherOwner.generation,
+				executorInstanceId: otherOwner.instanceId,
+			});
 			expect(queue.claim(owner(), Date.now()).kind).toBe("claimed");
-			// The second claimant's round must wait on the held WorkBuddy session.
+			// The second claimant's round must wait on the held WorkBuddy session:
+			// both rounds target wb-session-1, so that session is the blocker.
 			const second = queue.claim(otherOwner, Date.now());
 			expect(second).toMatchObject({ kind: "waiting", reason: "session_busy" });
 			if (second.kind === "waiting") {
-				expect(second.blockerIds).toContain("omp-session-2");
+				expect(second.blockerIds).toContain("wb-session-1");
 			}
 		} finally {
 			queue.close();
 		}
 	});
 
-	it("makes an overlapping write wait with scope_conflict while read/read shares", () => {
+	it("makes an overlapping write wait with scope_conflict while read/read shares", async () => {
 		prepareProject();
 		const queue = openProjectQueue(root, { mode: "write" })!;
 		try {
 			const otherOwner = owner({ sessionId: "omp-session-2", generation: "gen-2", instanceId: "instance-2" });
 			const db = openWriteConnection(root);
 			withImmediate(db, () => registerOwner(db, otherOwner, Date.now()));
-			queue.enqueue(enqueueInput());
-			// Different WorkBuddy session, same write path: must wait on scope.
-			queue.enqueue(
-				enqueueInput({
-					taskId: TASK_B,
-					requestId: REQUEST_B,
-					targetPolicy: { kind: "session", sessionId: "wb-session-2" },
-					ownerSession: otherOwner.sessionId,
-					ownerGeneration: otherOwner.generation,
-					executorInstanceId: otherOwner.instanceId,
-				}),
-			);
+			const first = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
+			queue.enqueue(first.input);
+			// Write-vs-read conflict: TASK_B's staged input lives inside TASK_A's
+			// outputs directory (a chained follow-up reading the previous round's
+			// deliverable while TASK_A is still running). Real file, real hash.
+			const chainedRel = `.wb-bridge/tasks/${TASK_A}/rounds/1/outputs/chain-input.txt`;
+			const secondStage = await stageRealSnapshot({
+				taskId: TASK_B,
+				round: 1,
+				requestId: REQUEST_B,
+				inputRel: chainedRel,
+				targetSessionId: "wb-session-2",
+			});
+			queue.enqueue({
+				...secondStage.input,
+				ownerSession: otherOwner.sessionId,
+				ownerGeneration: otherOwner.generation,
+				executorInstanceId: otherOwner.instanceId,
+			});
 			expect(queue.claim(owner(), Date.now()).kind).toBe("claimed");
 			const conflicting = queue.claim(otherOwner, Date.now());
 			expect(conflicting).toMatchObject({ kind: "waiting", reason: "scope_conflict" });
 			if (conflicting.kind === "waiting") {
 				expect(conflicting.blockerIds[0]).toContain(TASK_A);
 			}
+			// read/read sharing: a third round on a third WorkBuddy session reading
+			// the same input as the running task (write path distinct) claims fine.
+			const thirdOwner = owner({ sessionId: "omp-session-3", generation: "gen-3", instanceId: "instance-3" });
+			const thirdDb = openWriteConnection(root);
+			withImmediate(thirdDb, () => registerOwner(thirdDb, thirdOwner, Date.now()));
+			const thirdStage = await stageRealSnapshot({
+				taskId: TASK_C,
+				round: 1,
+				requestId: REQUEST_C,
+				targetSessionId: "wb-session-3",
+			});
+			queue.enqueue({
+				...thirdStage.input,
+				ownerSession: thirdOwner.sessionId,
+				ownerGeneration: thirdOwner.generation,
+				executorInstanceId: thirdOwner.instanceId,
+			});
+			const sharing = queue.claim(thirdOwner, Date.now());
+			expect(sharing.kind).toBe("claimed");
+		} finally {
+			queue.close();
+		}
+	});
+
+	it("keeps claiming younger unrelated rounds while the oldest waits on a busy session", async () => {
+		prepareProject();
+		const queue = openProjectQueue(root, { mode: "write" })!;
+		try {
+			// Round A targets wb-session-1; round B (same OMP owner) targets
+			// wb-session-2 with a disjoint input. wb-session-1 is occupied by a
+			// pre-existing hold, so the oldest candidate is blocked — B must still
+			// claim instead of starving behind A.
+			const secondStage = await stageRealSnapshot({
+				taskId: TASK_B,
+				round: 1,
+				requestId: REQUEST_B,
+				inputRel: "other-input.txt",
+				targetSessionId: "wb-session-2",
+			});
+			queue.enqueue(secondStage.input);
+			const first = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
+			queue.enqueue(first.input);
+			// Occupy wb-session-1 directly (as an already-running round would).
+			const db = openWriteConnection(root);
+			withImmediate(db, () => {
+				db.run(
+					`INSERT INTO holds(session_id, parent_kind, task_id, round, attempt_id, kind)
+					 VALUES('wb-session-1', 'delegated', ?, 1, NULL, 'execution')`,
+					[TASK_B],
+				);
+			});
+			const claim = queue.claim(owner(), Date.now());
+			expect(claim.kind).toBe("claimed");
+			if (claim.kind === "claimed") {
+				expect(claim.sessionId).toBe("wb-session-2");
+			}
+		} finally {
+			queue.close();
+		}
+	});
+
+	it("does not advance the domain revision when a claim loses its race", async () => {
+		prepareProject();
+		const queue = openProjectQueue(root, { mode: "write" })!;
+		try {
+			const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
+			queue.enqueue(input);
+			const revisionBefore = queue.inspect({}).revision;
+			// A pre-existing hold on the target session forces every candidate
+			// into the waiting path: no revision may be burned by the attempt.
+			const db = openWriteConnection(root);
+			withImmediate(db, () => {
+				db.run(
+					`INSERT INTO holds(session_id, parent_kind, task_id, round, attempt_id, kind)
+					 VALUES('wb-session-1', 'delegated', ?, 1, NULL, 'execution')`,
+					[TASK_A],
+				);
+			});
+			const claim = queue.claim(owner(), Date.now());
+			expect(claim).toMatchObject({ kind: "waiting", reason: "session_busy" });
+			const revisionAfter = queue.inspect({}).revision;
+			expect(revisionAfter).toBe(revisionBefore);
 		} finally {
 			queue.close();
 		}
@@ -335,11 +551,12 @@ describe("project queue - claim arbitration", () => {
 		}
 	});
 
-	it("ignores rounds owned by a different OMP session", () => {
+	it("ignores rounds owned by a different OMP session", async () => {
 		prepareProject();
+		const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
 		const queue = openProjectQueue(root, { mode: "write" })!;
 		try {
-			queue.enqueue(enqueueInput());
+			queue.enqueue(input);
 			const stranger = owner({ sessionId: "omp-session-other", generation: "gen-9", instanceId: "instance-9" });
 			const db = openWriteConnection(root);
 			withImmediate(db, () => registerOwner(db, stranger, Date.now()));
@@ -358,13 +575,14 @@ describe("project queue - read mode", () => {
 		expect(existsSync(path.join(root, ".wb-bridge"))).toBeFalse();
 	});
 
-	it("serves inspect from an existing database and refuses writes", () => {
+	it("serves inspect from an existing database and refuses writes", async () => {
 		prepareProject();
 		const queue = openProjectQueue(root, { mode: "read" })!;
 		try {
 			const snapshot = queue.inspect({});
 			expect(snapshot.tasks).toHaveLength(0);
-			expect(() => queue.enqueue(enqueueInput())).toThrow(/read-mode queue cannot enqueue/);
+			const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
+			expect(() => queue.enqueue(input)).toThrow(/read-mode queue cannot enqueue/);
 		} finally {
 			queue.close();
 		}
@@ -389,7 +607,8 @@ describe("project queue - real subprocess contention", () => {
 	it("lets exactly one of two concurrent claimants win one attempt", async () => {
 		prepareProject();
 		const queue = openProjectQueue(root, { mode: "write" })!;
-		queue.enqueue(enqueueInput());
+		const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
+		queue.enqueue(input);
 		queue.close();
 
 		// Two real processes race for the same single round. Each runs the
@@ -421,7 +640,7 @@ describe("project queue - real subprocess contention", () => {
 
 	it("enqueues through a real child process and the parent sees the row", async () => {
 		prepareProject();
-		const input = enqueueInput();
+		const { input } = await stageRealSnapshot({ taskId: TASK_A, round: 1, requestId: REQUEST_A });
 		const workerPath = path.resolve(import.meta.dir, "fixtures/queue-worker.ts");
 		const child = Bun.spawn(["bun", workerPath], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
 		child.stdin.write(

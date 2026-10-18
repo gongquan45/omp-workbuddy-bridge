@@ -73,7 +73,7 @@ export interface WorkRecordSummary {
 		totalRead: number;
 		totalWrite: number;
 	} | null;
-	state: "active" | "blocked" | "released";
+	state: "waiting" | "active" | "blocked" | "released";
 	workerStatus: string | null;
 	round: number | null;
 	milestone: string;

@@ -17,16 +17,25 @@ import process from "node:process";
 import { atomicWriteFile, tryCreateLockFile } from "./storage";
 import type {
 	Binding,
+	BoundSession,
+	DeliveryMode,
 	ExternalAction,
 	FileArtifact,
 	InputSnapshot,
+	ManifestApproval,
+	ManifestInput,
+	OwnerIdentity,
 	PreparedTask,
 	RoundConfirmation,
+	RoundConfirmationV3,
+	StagedTask,
 	StoredTaskSummary,
+	TargetPolicy,
 	TaskError,
 	TaskGoal,
 	TaskListWarning,
 	TaskLock,
+	TaskManifestPayload,
 	TaskReceipt,
 	TaskRequest,
 	TaskRound,
@@ -65,12 +74,13 @@ function validateBindingShape(raw: unknown, source: string): Binding {
 		);
 	}
 
-	if (!("version" in raw) || raw.version !== 1) {
+	if (!("version" in raw) || (raw.version !== 1 && raw.version !== 2)) {
 		throw new WbTaskError(
 			WB_ERROR_CODE.bindingInvalid,
-			`Malformed binding file at ${source}: expected version 1, got ${String("version" in raw ? raw.version : "missing")}`
+			`Malformed binding file at ${source}: expected version 1 or 2, got ${String("version" in raw ? raw.version : "missing")}`
 		);
 	}
+	const version = raw.version;
 
 	if (!("projectRoot" in raw) || typeof raw.projectRoot !== "string" || raw.projectRoot.trim().length === 0) {
 		throw new WbTaskError(
@@ -93,12 +103,81 @@ function validateBindingShape(raw: unknown, source: string): Binding {
 		);
 	}
 
-	return {
-		version: 1,
+	// A v2 binding carries a session roster. It is validated fail-closed: a
+	// malformed entry rejects the whole file rather than being filtered out,
+	// because silently accepting a scrubbed roster would let any writer widen
+	// the set of sessions this project may delegate to.
+	const result: Binding = {
+		version,
 		projectRoot: raw.projectRoot,
 		sessionId: raw.sessionId,
 		workbuddyVersion: raw.workbuddyVersion,
 	};
+	if (version === 2) {
+		if (!("sessions" in raw) || !Array.isArray(raw.sessions)) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.bindingInvalid,
+				`Malformed binding file at ${source}: version 2 requires a sessions array`
+			);
+		}
+		const sessions: BoundSession[] = [];
+		for (const entry of raw.sessions) {
+			if (typeof entry !== "object" || entry === null) {
+				throw new WbTaskError(
+					WB_ERROR_CODE.bindingInvalid,
+					`Malformed binding file at ${source}: every roster entry must be an object`
+				);
+			}
+			const candidate = entry as Record<string, unknown>;
+			if (
+				typeof candidate.sessionId !== "string" ||
+				candidate.sessionId.trim().length === 0
+			) {
+				throw new WbTaskError(
+					WB_ERROR_CODE.bindingInvalid,
+					`Malformed binding file at ${source}: every roster entry needs a non-empty sessionId`
+				);
+			}
+			if (candidate.role !== undefined && typeof candidate.role !== "string") {
+				throw new WbTaskError(
+					WB_ERROR_CODE.bindingInvalid,
+					`Malformed binding file at ${source}: roster entry role must be a string when present`
+				);
+			}
+			if (candidate.title !== undefined && typeof candidate.title !== "string") {
+				throw new WbTaskError(
+					WB_ERROR_CODE.bindingInvalid,
+					`Malformed binding file at ${source}: roster entry title must be a string when present`
+				);
+			}
+			if (candidate.isDefault !== undefined && typeof candidate.isDefault !== "boolean") {
+				throw new WbTaskError(
+					WB_ERROR_CODE.bindingInvalid,
+					`Malformed binding file at ${source}: roster entry isDefault must be a boolean when present`
+				);
+			}
+			const rosterEntry: BoundSession = { sessionId: candidate.sessionId };
+			if (candidate.role !== undefined) {
+				rosterEntry.role = candidate.role;
+			}
+			if (candidate.title !== undefined) {
+				rosterEntry.title = candidate.title;
+			}
+			if (candidate.isDefault !== undefined) {
+				rosterEntry.isDefault = candidate.isDefault;
+			}
+			sessions.push(rosterEntry);
+		}
+		result.sessions = sessions;
+	} else if ("sessions" in raw) {
+		// A roster under a v1 version marker means the file was edited without
+		// bumping the version: treat it as tampering, not as a v2 binding.
+		throw new WbTaskError(
+			WB_ERROR_CODE.bindingInvalid,
+			`Malformed binding file at ${source}: version 1 must not carry a sessions roster`
+		);
+	}
+	return result;
 }
 
 /**
@@ -536,11 +615,16 @@ export function isPidAlive(pid: number): boolean {
  * Reads the project's single-task lock without creating, repairing or removing
  * anything.
  *
+ * Per-session locks are the beta-era form; stage 4 replaces this file-lock path entirely.
+ *
+ * @param projectRoot The project root directory.
+ * @param sessionId Optional session identifier. When provided, reads `.wb-bridge/active-<sessionId>.lock`
+ *   first and falls back to legacy `active.lock` if absent.
  * @returns The lock record, or null when the project or the lock is absent.
  * @throws WbTaskError `WB_TASK_STATE_INVALID` when the lock is present but not a
  *   real, well-formed lock file and `WB_STORAGE_ERROR` when it cannot be read.
  */
-export async function readTaskLock(projectRoot: string): Promise<TaskLock | null> {
+export async function readTaskLock(projectRoot: string, sessionId?: string): Promise<TaskLock | null> {
 	let root: string;
 	try {
 		root = await realpath(projectRoot);
@@ -554,65 +638,83 @@ export async function readTaskLock(projectRoot: string): Promise<TaskLock | null
 		);
 	}
 
-	const lockPath = path.join(root, ".wb-bridge", "active.lock");
-
-	// The lock must be a real regular file: a symlink could point anywhere, and
-	// reading through it would report state that is not this project's.
-	let entryStat;
-	try {
-		entryStat = await lstat(lockPath);
-	} catch (err: unknown) {
-		if (typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT") {
-			return null;
+	async function readSingleLock(lockPath: string): Promise<TaskLock | null> {
+		// The lock must be a real regular file: a symlink could point anywhere, and
+		// reading through it would report state that is not this project's.
+		let entryStat;
+		try {
+			entryStat = await lstat(lockPath);
+		} catch (err: unknown) {
+			if (typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT") {
+				return null;
+			}
+			throw new WbTaskError(
+				WB_ERROR_CODE.storageError,
+				`Failed to inspect active lock at ${lockPath}: ${err instanceof Error ? err.message : String(err)}`
+			);
 		}
-		throw new WbTaskError(
-			WB_ERROR_CODE.storageError,
-			`Failed to inspect active lock at ${lockPath}: ${err instanceof Error ? err.message : String(err)}`
-		);
-	}
-	if (!entryStat.isFile()) {
-		throw new WbTaskError(
-			WB_ERROR_CODE.taskStateInvalid,
-			`Lock file at ${lockPath} is not a regular file`
-		);
-	}
-
-	let lockReal: string;
-	try {
-		lockReal = await realpath(lockPath);
-	} catch (err: unknown) {
-		if (typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT") {
-			// Removed between the lstat and the resolution: the slot is free.
-			return null;
+		if (!entryStat.isFile()) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.taskStateInvalid,
+				`Lock file at ${lockPath} is not a regular file`
+			);
 		}
-		throw new WbTaskError(
-			WB_ERROR_CODE.storageError,
-			`Failed to resolve active lock at ${lockPath}: ${err instanceof Error ? err.message : String(err)}`
-		);
-	}
-	const relFromRoot = path.relative(root, lockReal);
-	if (relFromRoot.startsWith("..") || path.isAbsolute(relFromRoot) || relFromRoot === "") {
-		throw new WbTaskError(
-			WB_ERROR_CODE.taskStateInvalid,
-			`Lock file at ${lockPath} resolves outside the project root`
-		);
-	}
 
-	let content: string;
-	try {
-		content = await readFile(lockPath, "utf-8");
-	} catch (err: unknown) {
-		if (typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT") {
-			return null;
+		let lockReal: string;
+		try {
+			lockReal = await realpath(lockPath);
+		} catch (err: unknown) {
+			if (typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT") {
+				// Removed between the lstat and the resolution: the slot is free.
+				return null;
+			}
+			throw new WbTaskError(
+				WB_ERROR_CODE.storageError,
+				`Failed to resolve active lock at ${lockPath}: ${err instanceof Error ? err.message : String(err)}`
+			);
 		}
-		throw new WbTaskError(
-			WB_ERROR_CODE.storageError,
-			`Failed to read active lock file at ${lockPath}: ${err instanceof Error ? err.message : String(err)}`
-		);
+		const relFromRoot = path.relative(root, lockReal);
+		if (relFromRoot.startsWith("..") || path.isAbsolute(relFromRoot) || relFromRoot === "") {
+			throw new WbTaskError(
+				WB_ERROR_CODE.taskStateInvalid,
+				`Lock file at ${lockPath} resolves outside the project root`
+			);
+		}
+
+		let content: string;
+		try {
+			content = await readFile(lockPath, "utf-8");
+		} catch (err: unknown) {
+			if (typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT") {
+				return null;
+			}
+			throw new WbTaskError(
+				WB_ERROR_CODE.storageError,
+				`Failed to read active lock file at ${lockPath}: ${err instanceof Error ? err.message : String(err)}`
+			);
+		}
+
+		return parseLockContent(content, lockPath);
 	}
 
-	return parseLockContent(content, lockPath);
+	if (sessionId !== undefined) {
+		if (!UUID_PATTERN.test(sessionId)) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.inputInvalid,
+				`Supplied sessionId "${sessionId}" must be a valid UUID`
+			);
+		}
+		const sessionLockPath = path.join(root, ".wb-bridge", `active-${sessionId}.lock`);
+		const sessionLock = await readSingleLock(sessionLockPath);
+		if (sessionLock !== null) {
+			return sessionLock;
+		}
+	}
+
+	const legacyLockPath = path.join(root, ".wb-bridge", "active.lock");
+	return readSingleLock(legacyLockPath);
 }
+
 
 /** Validates one lock file's bytes, keeping the state-invalid classification. */
 function parseLockContent(content: string, lockPath: string): TaskLock {
@@ -790,10 +892,13 @@ export async function writeBinding(binding: Binding): Promise<void> {
 
 	const content = JSON.stringify(
 		{
-			version: 1,
+			version: binding.version,
 			projectRoot: root,
 			sessionId: binding.sessionId,
 			workbuddyVersion: binding.workbuddyVersion,
+			// A v1 file must not carry a roster: the validator rejects that shape
+			// as tampering, so writing it would make our own file unreadable.
+			...(binding.version === 2 ? { sessions: binding.sessions ?? [] } : {}),
 		},
 		null,
 		2
@@ -1539,5 +1644,479 @@ export async function collectArtifacts(
 	return {
 		artifacts,
 		missingOutputs,
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Frozen staging: the manifest that a confirmed round is executed against.
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalizes a project-relative path for manifests and stage snapshots.
+ *
+ * Project-relative paths inside frozen manifests and stage snapshots must
+ * never traverse outside the project root or use drive letters / absolute paths,
+ * so that relative resolution always stays contained within the project and
+ * produces identical path keys across platforms.
+ *
+ * @throws WbTaskError `WB_ERROR_CODE.inputInvalid` if path is absolute, has drive
+ *   letters, or contains '..' traversal segments.
+ */
+export function canonicalRelPath(raw: string): string {
+	if (typeof raw !== "string" || raw.trim().length === 0) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.inputInvalid,
+			`Scope path must be a non-empty string, got: "${String(raw)}"`
+		);
+	}
+
+	if (
+		path.isAbsolute(raw) ||
+		/^[a-zA-Z]:/.test(raw) ||
+		raw.startsWith("/") ||
+		raw.startsWith("\\")
+	) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.inputInvalid,
+			`Scope path must be relative: "${raw}"`
+		);
+	}
+
+	const rawSegments = raw.split(/[/\\]/);
+	if (rawSegments.some((seg) => seg === "..")) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.inputInvalid,
+			`Scope path contains '..' traversal: "${raw}"`
+		);
+	}
+
+	const normalized = path.normalize(raw).split(path.sep).join("/");
+	const normSegments = normalized.split("/");
+	if (normSegments.some((seg) => seg === "..")) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.inputInvalid,
+			`Scope path contains '..' traversal: "${raw}"`
+		);
+	}
+
+	const cleaned = normalized.replace(/\/+$/, "");
+	if (cleaned === "" || cleaned === ".") {
+		throw new WbTaskError(
+			WB_ERROR_CODE.inputInvalid,
+			`Scope path cannot target the entire project root: "${raw}"`
+		);
+	}
+
+	return cleaned;
+}
+
+/**
+ * Validates one expected-output path relative to a round's outputs directory.
+ *
+ * Rejects non-string/empty inputs, absolute paths, drive letters, '..' segments,
+ * and escapes from the target outputs directory so that tasks cannot declare
+ * outputs that overwrite project files or escape staging boundaries.
+ */
+export function validateOutputPath(rawOut: string, outputsDir: string): string {
+	if (typeof rawOut !== "string" || rawOut.trim().length === 0) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.inputInvalid,
+			`Expected output path must be a non-empty string, got: "${String(rawOut)}"`
+		);
+	}
+
+	if (
+		path.isAbsolute(rawOut) ||
+		rawOut.startsWith("/") ||
+		rawOut.startsWith("\\") ||
+		/^[a-zA-Z]:/.test(rawOut)
+	) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.inputInvalid,
+			`Expected output path must be relative to outputs directory: "${rawOut}"`
+		);
+	}
+
+	const segments = rawOut.split(/[/\\]/);
+	if (segments.some((seg) => seg === "..")) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.inputInvalid,
+			`Expected output path contains '..' traversal: "${rawOut}"`
+		);
+	}
+
+	const resolvedOut = path.resolve(outputsDir, rawOut);
+	const relFromOutputs = path.relative(outputsDir, resolvedOut);
+	if (relFromOutputs.startsWith("..") || path.isAbsolute(relFromOutputs) || relFromOutputs === "") {
+		throw new WbTaskError(
+			WB_ERROR_CODE.inputInvalid,
+			`Expected output path escapes outputs directory: "${rawOut}"`
+		);
+	}
+
+	return path.normalize(rawOut).split(path.sep).join("/");
+}
+
+/**
+ * Validates and normalizes an optional list of expected outputs against the outputs directory.
+ * Dedupes preserving first-occurrence order, returning an empty array when none are given.
+ */
+export function validatedOutputPaths(expectedOutputs: string[] | undefined, outputsDir: string): string[] {
+	if (!expectedOutputs || expectedOutputs.length === 0) {
+		return [];
+	}
+	const seen = new Set<string>();
+	const validated: string[] = [];
+	for (const rawOut of expectedOutputs) {
+		const normalized = validateOutputPath(rawOut, outputsDir);
+		if (!seen.has(normalized)) {
+			seen.add(normalized);
+			validated.push(normalized);
+		}
+	}
+	return validated;
+}
+
+/**
+ * Canonical JSON serialization used to compute deterministic manifest digests.
+ *
+ * Object keys are sorted recursively (lexicographically by UTF-16 code units),
+ * array elements preserve their exact order, undefined object values are omitted,
+ * and no whitespace is emitted.
+ */
+export function canonicalJson(value: unknown): string {
+	if (value === null || typeof value !== "object") {
+		return JSON.stringify(value);
+	}
+	if (Array.isArray(value)) {
+		return `[${value.map((item) => (item === undefined ? "null" : canonicalJson(item))).join(",")}]`;
+	}
+	const entries = Object.entries(value).filter(([, v]) => v !== undefined);
+	entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+	const serializedEntries = entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`);
+	return `{${serializedEntries.join(",")}}`;
+}
+
+/**
+ * Builds a deterministic manifest payload for a task round.
+ *
+ * Pure function with no filesystem I/O.
+ * Invariants:
+ * 1. `expectedOutputs` is shallow-copied.
+ * 2. `inputs` is shallow-copied and sorted by `path` ascending BEFORE hashing.
+ *    This sort order establishes the digest invariant so every caller (confirmation
+ *    dialog, staging, and queue verification) hashes the exact same sequence.
+ */
+export function buildTaskManifestPayload(input: {
+	projectRoot: string;
+	requestId: string;
+	taskId: string;
+	round: number;
+	owner: OwnerIdentity;
+	goal: TaskGoal;
+	targetPolicy: TargetPolicy;
+	expectedOutputs: string[];
+	inputs: ManifestInput[];
+	deliveryMode: DeliveryMode;
+}): TaskManifestPayload {
+	const sortedInputs = [...input.inputs]
+		.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+		.map((item) => ({ ...item }));
+
+	return {
+		version: 1,
+		projectRoot: input.projectRoot,
+		requestId: input.requestId,
+		taskId: input.taskId,
+		round: input.round,
+		owner: input.owner,
+		goal: input.goal,
+		targetPolicy: input.targetPolicy,
+		expectedOutputs: [...input.expectedOutputs],
+		inputs: sortedInputs,
+		deliveryMode: input.deliveryMode,
+	};
+}
+
+/**
+ * Computes the canonical SHA-256 digest of a task manifest payload.
+ *
+ * Only the payload is hashed; the approval block and the digest itself are
+ * excluded so nothing self-references.
+ */
+export function hashManifestPayload(payload: TaskManifestPayload): string {
+	return crypto.createHash("sha256").update(canonicalJson(payload), "utf-8").digest("hex");
+}
+
+/**
+ * Stages frozen input snapshots and writes the manifest for a confirmed round.
+ *
+ * Staging guarantees:
+ * 1. The stage UUID and physical directory path are deliberately excluded from
+ *    the payload digest, making the digest pure and portable across hosts.
+ * 2. The snapshot root is the directory CONTAINING `inputs/`; every input file
+ *    is placed in `inputs/<project-relative-path>`.
+ * 3. Concurrent or retried stagings of the same request never overwrite an existing
+ *    stage directory because each invocation allocates a fresh random stage UUID.
+ * 4. Staged copies are verified against their confirmed sha256 digests and source
+ *    file sizes/mtimes before and after copying to ensure inputs did not mutate mid-flight.
+ *
+ * @param root The project root directory.
+ * @param confirmation Human confirmation with expected payload hash and inputs.
+ * @param request The task request carrying goal, inputs, and expected outputs.
+ * @param taskId Unique task UUID.
+ * @param round Round number for this task execution.
+ * @returns The staged task details including paths, payload, and approval record.
+ */
+export async function stageTask(
+	root: string,
+	confirmation: RoundConfirmationV3,
+	request: TaskRequest,
+	taskId: string,
+	round: number
+): Promise<StagedTask> {
+	// 1. Validate confirmation.requestId, taskId and targetPolicy kind
+	if (!UUID_PATTERN.test(confirmation.requestId)) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.inputInvalid,
+			`Supplied requestId "${confirmation.requestId}" must be a valid UUID`
+		);
+	}
+	if (!UUID_PATTERN.test(taskId)) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.inputInvalid,
+			`Supplied taskId "${taskId}" must be a valid UUID`
+		);
+	}
+	if (
+		!confirmation.targetPolicy ||
+		(confirmation.targetPolicy.kind !== "session" && confirmation.targetPolicy.kind !== "workspace_pool")
+	) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.inputInvalid,
+			`Target policy kind must be "session" or "workspace_pool"`
+		);
+	}
+
+	// 2. Canonicalize project root once; every digest and boundary check uses this real root.
+	let canonicalRoot: string;
+	try {
+		canonicalRoot = await realpath(root);
+	} catch (err: unknown) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.inputInvalid,
+			`Project root does not exist or cannot be resolved: "${root}"`
+		);
+	}
+
+	// 3. Cross-check request.inputFiles against confirmation.inputs BY PATH (both directions)
+	const requestInputPaths = new Set<string>();
+	for (const rawPath of request.inputFiles ?? []) {
+		const rel = canonicalRelPath(rawPath);
+		requestInputPaths.add(rel);
+	}
+
+	const confirmedInputPaths = new Set<string>();
+	const confirmedByPath = new Map<string, { path: string; sha256: string }>();
+	for (const input of confirmation.inputs) {
+		const rel = canonicalRelPath(input.path);
+		confirmedInputPaths.add(rel);
+		confirmedByPath.set(rel, { path: rel, sha256: input.sha256 });
+	}
+
+	for (const p of requestInputPaths) {
+		if (!confirmedInputPaths.has(p)) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.inputInvalid,
+				`Requested input file "${p}" is not part of the confirmed manifest`
+			);
+		}
+	}
+
+	for (const p of confirmedInputPaths) {
+		if (!requestInputPaths.has(p)) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.inputInvalid,
+				`Confirmed input file "${p}" is missing from the request`
+			);
+		}
+	}
+
+	// 4. Build confirmedByPath map, sort keys, stat source, realpath, and check boundary
+	const sortedPaths = [...confirmedByPath.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+	interface VerifiedSource {
+		relPath: string;
+		absoluteSource: string;
+		confirmedSha: string;
+		size: number;
+		mtimeMs: number;
+	}
+	const verifiedSources: VerifiedSource[] = [];
+
+	for (const relPath of sortedPaths) {
+		const confirmed = confirmedByPath.get(relPath);
+		if (confirmed === undefined) {
+			continue;
+		}
+		const absoluteSource = path.resolve(canonicalRoot, relPath);
+		let st;
+		try {
+			st = await stat(absoluteSource);
+		} catch {
+			throw new WbTaskError(
+				WB_ERROR_CODE.inputInvalid,
+				`Input file does not exist: "${relPath}"`
+			);
+		}
+		if (!st.isFile()) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.inputInvalid,
+				`Input file is not a regular file: "${relPath}"`
+			);
+		}
+
+		let sourceReal: string;
+		try {
+			sourceReal = await realpath(absoluteSource);
+		} catch {
+			throw new WbTaskError(
+				WB_ERROR_CODE.inputInvalid,
+				`Input file realpath resolution failed: "${relPath}"`
+			);
+		}
+
+		const relFromRoot = path.relative(canonicalRoot, sourceReal);
+		if (relFromRoot.startsWith("..") || path.isAbsolute(relFromRoot) || relFromRoot === "") {
+			throw new WbTaskError(
+				WB_ERROR_CODE.inputInvalid,
+				`Input file resolves outside project root: "${relPath}"`
+			);
+		}
+
+		verifiedSources.push({
+			relPath,
+			absoluteSource,
+			confirmedSha: confirmed.sha256,
+			size: st.size,
+			mtimeMs: st.mtimeMs,
+		});
+	}
+
+	// 5. Build payload via buildTaskManifestPayload with validatedOutputPaths
+	const outputsDir = path.join(canonicalRoot, ".wb-bridge", "tasks", taskId, "rounds", String(round), "outputs");
+	const expectedOutputs = validatedOutputPaths(request.expectedOutputs, outputsDir);
+
+	const initialManifestInputs: ManifestInput[] = verifiedSources.map((s) => ({
+		path: s.relPath,
+ 		snapshotPath: `inputs/${s.relPath}`,
+		bytes: s.size,
+		sha256: s.confirmedSha,
+	}));
+
+	const payload = buildTaskManifestPayload({
+		projectRoot: canonicalRoot,
+		requestId: confirmation.requestId,
+		taskId,
+		round,
+		owner: confirmation.owner,
+		goal: request.goal,
+		targetPolicy: confirmation.targetPolicy,
+		expectedOutputs,
+		inputs: initialManifestInputs,
+		deliveryMode: confirmation.deliveryMode,
+	});
+
+	// 6. Check payloadSha256 against confirmation.manifestSha256
+	const payloadSha256 = hashManifestPayload(payload);
+	if (payloadSha256 !== confirmation.manifestSha256) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.inputInvalid,
+			`Manifest payload digest (${payloadSha256}) does not match confirmed digest (${confirmation.manifestSha256}): inputs may have changed between confirmation and staging`
+		);
+	}
+
+	// 7. Create stage dir with inputs/ subdir, copy files, re-stat before and after, hash copy
+	const stageUuid = crypto.randomUUID();
+	const snapshotRoot = path.join(canonicalRoot, ".wb-bridge", "requests", confirmation.requestId, "stages", stageUuid);
+	const stageInputsDir = path.join(snapshotRoot, "inputs");
+	await mkdir(stageInputsDir, { recursive: true });
+
+	const stagedInputs: ManifestInput[] = [];
+	for (const source of verifiedSources) {
+		const preStat = await stat(source.absoluteSource);
+		if (preStat.size !== source.size || preStat.mtimeMs !== source.mtimeMs) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.inputInvalid,
+				`Input file "${source.relPath}" changed while being staged (pre-copy stat mismatch)`
+			);
+		}
+
+		const targetFile = path.join(stageInputsDir, path.normalize(source.relPath));
+		await mkdir(path.dirname(targetFile), { recursive: true });
+		await copyFile(source.absoluteSource, targetFile);
+
+		const postStat = await stat(source.absoluteSource);
+		if (postStat.size !== source.size || postStat.mtimeMs !== source.mtimeMs) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.inputInvalid,
+				`Input file "${source.relPath}" changed while being staged (post-copy stat mismatch)`
+			);
+		}
+
+		const copySha = await computeFileSha256(targetFile);
+		if (copySha !== source.confirmedSha) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.inputInvalid,
+				`Staged copy of "${source.relPath}" does not match the confirmed hash (got ${copySha}, expected ${source.confirmedSha})`
+			);
+		}
+
+		stagedInputs.push({
+			path: source.relPath,
+			snapshotPath: `inputs/${source.relPath}`,
+			bytes: postStat.size,
+			sha256: copySha,
+		});
+	}
+
+	// 8. Write manifest.json via atomicWriteFile
+	const manifestPath = path.join(snapshotRoot, "manifest.json");
+	const approval: ManifestApproval = {
+		source: confirmation.source,
+		at: confirmation.at,
+		payloadSha256,
+	};
+	const finalPayload: TaskManifestPayload = {
+		...payload,
+		inputs: stagedInputs,
+	};
+	const manifestContent = JSON.stringify(
+		{
+			payload: finalPayload,
+			approval,
+		},
+		null,
+		2
+	);
+	// Self-check before publishing: the bytes about to be written must hash to
+	// the same digest the caller confirmed, or enqueue would later reject the
+	// manifest as tampered. This is an internal invariant, not user input.
+	if (hashManifestPayload(finalPayload) !== payloadSha256) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.taskStateInvalid,
+			`Staged manifest inputs diverged from the confirmed payload digest`
+		);
+	}
+	await atomicWriteFile(snapshotRoot, manifestPath, manifestContent);
+
+	// 9. Return StagedTask
+	return {
+		snapshotRoot,
+		manifestPath,
+		manifestSha256: payloadSha256,
+		manifest: {
+			payload: finalPayload,
+			approval,
+		},
 	};
 }

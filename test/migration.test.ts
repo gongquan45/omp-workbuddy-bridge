@@ -15,14 +15,13 @@ import { legacyRequestId, migrateProjectToQueue } from "../src/migration";
 import { atomicWriteFile } from "../src/storage";
 import { WbTaskError } from "../src/tasks";
 import { WB_ERROR_CODE, type TaskReceipt } from "../src/types";
-import { spawn, process } from "node:child_process";
 
 let root = "";
 /** Set only once a fixture root exists; guards the cleanup below. */
 let rootReady = false;
 
 beforeEach(async () => {
-	root = await realpath(await mkdtemp(path.join(tmpdir(), "wb-migration-")));
+	root = await realpath(await mkdtemp(path.join(os.tmpdir(), "wb-migration-")));
 	rootReady = true;
 });
 

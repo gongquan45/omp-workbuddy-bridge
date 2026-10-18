@@ -11,6 +11,7 @@
  */
 
 import { openProjectQueue, openWriteConnection, withImmediate, registerOwner } from "../../src/queue";
+import type { OwnerIdentity } from "../../src/types";
 
 interface WorkerMessage {
 	op: "enqueue" | "claim" | "close";
@@ -46,23 +47,38 @@ async function main(): Promise<void> {
 				respond({ ok: false, error: { code: "WB_INPUT_INVALID", message: "root and owner are required" } });
 				continue;
 			}
+			// Narrow the IPC-supplied owner before it reaches typed APIs: the
+			// fixture is a cross-process boundary, so the shape is validated here
+			// rather than asserted.
+			const owner = parsed.owner;
+			if (
+				typeof owner.sessionId !== "string" ||
+				typeof owner.generation !== "string" ||
+				typeof owner.instanceId !== "string"
+			) {
+				respond({ ok: false, error: { code: "WB_INPUT_INVALID", message: "owner identity is incomplete" } });
+				continue;
+			}
+			const identity: OwnerIdentity = {
+				sessionId: owner.sessionId,
+				generation: owner.generation,
+				instanceId: owner.instanceId,
+				processId: process.pid,
+			};
 			if (parsed.op === "claim") {
 				const queue = openProjectQueue(parsed.root, { mode: "write" });
 				if (queue === null) {
 					respond({ ok: false, error: { code: "WB_STORAGE_ERROR", message: "no queue" } });
 					continue;
 				}
-				const outcome = queue.claim(
-					{ ...parsed.owner, processId: process.pid },
-					Date.now(),
-				);
+				const outcome = queue.claim(identity, Date.now());
 				respond({ ok: true, result: outcome });
 				continue;
 			}
 			// enqueue: the parent pre-registers owner and enables the project; the
 			// worker proves its writer can insert through the same file.
 			const db = openWriteConnection(parsed.root);
-			withImmediate(db, () => registerOwner(db, { ...parsed.owner, processId: process.pid }, Date.now()));
+			withImmediate(db, () => registerOwner(db, identity, Date.now()));
 			const queue = openProjectQueue(parsed.root, { mode: "write" });
 			if (queue === null) {
 				respond({ ok: false, error: { code: "WB_STORAGE_ERROR", message: "no queue" } });
