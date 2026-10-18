@@ -55,7 +55,9 @@
 | `src/tasks.ts` 的 v2.1 增量 | `stageTask`、manifest 助手、`canonicalRelPath`、输出校验抽取 | ~200 行增量 |
 | `src/collaboration.ts` 的 v2.1 增量 | 正选占用谓词、`waiting` 状态校验 | ~20 行增量 |
 | `src/index.ts` 的 v2.1 增量 | 延迟 `logEvent` 接线、`setLogWarnSink`、正选占用过滤 | ~40 行增量 |
-| `test/tasks.test.ts` 的 v2.1 增量 | `stageTask` 五个用例 | ~450 行增量 |
+| `test/tasks.test.ts` 的 v2.1 增量 | `stageTask` 五个用例（文件本身已从远端恢复，仅此增量丢失） | ~200 行增量 |
+
+> 说明：`src/tasks.ts`（1,543 行）、`test/tasks.test.ts`（1,406 行）、`src/collaboration.ts`（925 行）、`src/index.ts`（2,520 行）、`src/desktop-client.ts`（1,480 行）等**文件整体均从远端完好恢复**；上表所列仅为本会话在 beta/阶段 1–3 期间叠加在这些文件之上的增量，它们从未推送，故随工作树一同丢失。
 
 ### 3.2 曾丢失、已从会话记录恢复
 
@@ -80,10 +82,10 @@
 
 ### 3.4 定量影响
 
-- 丢失源码：约 3,000–4,000 行（含 beta 三提交的增量与阶段 1–3 的增量）。
-- 丢失测试：`test/tasks.test.ts` 的 v2.1 增量（`stageTask` 五用例）。
-- 保住源码：约 9,900 行（远端基线 9,891 行 + 恢复的 2,145 行，扣除重叠）。
-- 保住测试：远端 186 项 + 恢复 54 项。
+- 丢失源码：约 3,000–4,000 行（beta 三提交的增量 + 阶段 1–3 在既有文件上的增量，如 `tasks.ts` 的 `stageTask` 段、`collaboration.ts` 的占用谓词、`index.ts` 的日志接线）。
+- 丢失测试：`test/tasks.test.ts` 的 `stageTask` 五用例（该文件本身已从远端完整恢复，1,406 行）。
+- 保住源码：**9,891 行基线（11 个模块，来自远端 `9f01805`）+ 2,145 行新模块（`queue.ts` 1,166 + `migration.ts` 384 + `logging.ts` 595）**，两类不重叠。
+- 保住测试：远端基线 186 项 + 恢复的 54 项（queue 22 / migration 21 / logging 11）。
 
 ---
 
@@ -164,7 +166,7 @@ afterEach(async () => {
 
 ### 5.4 建议的后续措施
 
-1. **立即**：把防护模板推广到远端基线的**所有**测试文件（`test/tasks.test.ts` 1,406 行、`test/collaboration.test.ts`、`test/mcp.test.ts`、`test/acp-http.test.ts`、`test/approval.test.ts`、`test/desktop-client*.test.ts`）——它们来自远端，尚未加载防护。
+1. **已完成**：远端基线 7 个测试套件经审计**全部安全**（数组弹出式清理，无裸根），无需加载防护；防护仅加在本会话新写的三个文件上，已完成并随文件进入新树。
 2. **立即**：`bun test` 前先在 CI 或本地脚本中断言"测试清理只对 `os.tmpdir()` 下的路径生效"。
 3. **短期**：所有提交后立即 `git push`，使本地提交不再有单点故障。本次事故中"从未推送"是损失不可逆的唯一原因。
 4. **短期**：为 `fs.rm` 建立薄封装 `removeFixtureRoot(root)`，内置绝对路径断言与 `os.tmpdir()` 包含性检查，并禁止直接调用 `fs.rm` 递归形式。
@@ -194,6 +196,7 @@ afterEach(async () => {
 | 当前 typecheck | **18 个错误** |
 | 失败性质 | `SyntaxError: Export named 'hashManifestPayload' not found in src/tasks.ts` —— `tasks.ts` 尚未补入 manifest 助手，属**已知缺口**，非事故重演 |
 | 防护验证 | 三个移植测试文件中 `rootReady` + `path.isAbsolute` 均存在 |
+| 全部测试套件清理方式审计 | 远端来源 7 个套件**均安全**：`approval`/`collaboration`/`mcp` 用 `allocatedRoots` 数组；`tasks` 用 `allocatedTempDirs` 数组；`desktop-client`/`desktop-client-acp` 用 `temporaryDirs` 数组 + `rmSync`；`acp-http` 无临时目录清理。**无一使用裸 `let root` + 无条件 `rm`**，故该缺陷仅存在于本会话新写的三个文件，未扩散至基线 |
 
 ### 6.3 待完成（按依赖序）
 
@@ -201,7 +204,7 @@ afterEach(async () => {
 2. `src/tasks.ts` **追加**：`canonicalJson`、`canonicalRelPath`、`buildTaskManifestPayload`、`hashManifestPayload`、`validateOutputPath`/`validatedOutputPaths`、`stageTask`；`readTaskLock` 增加可选 `sessionId` 参数。
 3. 修 `test/migration.test.ts` 两处头部笔误（`import { spawn, process } from "node:child_process"`、裸 `tmpdir()`）。
 4. `typecheck` 归零 → `bun test` 恢复全绿 → 阶段 3 继续。
-5. 补 `test/tasks.test.ts` 的 `stageTask` 用例（原文件已丢失，需重写）。
+5. 补 `test/tasks.test.ts` 的 `stageTask` 用例（文件本体已从远端恢复至 1,406 行，仅需重写丢失的五个 `stageTask` 用例）。
 
 ---
 
