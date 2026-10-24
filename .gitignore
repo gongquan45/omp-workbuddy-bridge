@@ -7,9 +7,6 @@ node_modules/
 !.env.example
 
 # Untracked project & research documents
-/omp-workbuddy-bridge-plan.md
-/AGENTS.md
-/CHANGELOG.md
 /memorix-dual-client-validation-report.md
 /WorkBuddy工作原理与意图场景全景报告.md
 
@@ -17,3 +14,9 @@ node_modules/
 /_recovered/
 /memorix-report-backup.md
 /omp-wb-bridge-requirements-backup.md
+
+# Keep local evidence and internal working records out of source-only publication
+/docs/
+/smoke-workspace/
+/AGENTS.md
+/CHANGELOG.md

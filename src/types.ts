@@ -11,6 +11,22 @@ export interface BoundSession {
 	role?: string;
 	title?: string;
 	isDefault?: boolean;
+	/**
+	 * WorkBuddy version observed for this member when it was enrolled.
+	 *
+	 * Kept per member because a roster can hold sessions that were created by
+	 * different desktop versions, and the connection identity of one member must
+	 * not be described with another member's version.
+	 */
+	workbuddyVersion?: string;
+	/**
+	 * Whether this member was verified live in the last reconciliation.
+	 *
+	 * A member can be enrolled from the desktop catalog without being reachable:
+	 * it is then known to belong to this project, but nothing proves that a live
+	 * worker owns it right now, so it must never be handed new work.
+	 */
+	verified?: boolean;
 }
 
 /** Stable identity of the WorkBuddy session a project delegates to. */
@@ -25,12 +41,30 @@ export interface Binding {
 	workbuddyVersion: string;
 	/** Session pool roster for multi-session support. */
 	sessions?: BoundSession[];
+	/**
+	 * Whether the user consented to enrolling every verified session of this
+	 * project automatically.
+	 *
+	 * The consent is project-wide and persistent: once given, a restart may
+	 * re-enroll sessions opened later without asking again. It never authorizes
+	 * a session belonging to another project.
+	 */
+	autoBindProjectSessions?: boolean;
 }
 
-/** Lifecycle state of one delegated task. */
+/**
+ * Lifecycle state of one delegated task.
+ *
+ * `queued` and `awaiting_help` exist because a task can be admitted before any
+ * session runs it, and can be blocked on an OMP answer. Every consumer that
+ * branches on status must therefore decide what those mean for it — notably that
+ * neither is terminal, so a queued task is never reported as delivered.
+ */
 export type TaskStatus =
+	| "queued"
 	| "running"
 	| "awaiting_approval"
+	| "awaiting_help"
 	| "completed"
 	| "failed"
 	| "cancelled"
@@ -86,8 +120,38 @@ export interface TaskView {
 	progress: string;
 	awaitingApproval: boolean;
 	ownedByCurrentProcess: boolean;
-	/** Set when the terminal state could not be committed to disk. */
+	/**
+	 * Whether the terminal state has been durably committed.
+	 *
+	 * Separate from `status` because "the worker finished" and "the result is
+	 * provably on disk" are different facts: a completed round whose receipt could
+	 * not be written must not be presented as deliverable.
+	 */
+	commitState: "pending" | "committed" | "failed";
+	/** True only for a `completed` round whose commit is `committed`. */
+	readyForReview: boolean;
+	/** Set when the terminal state could not be durably committed to disk. */
 	storageError: TaskError | null;
+	/**
+	 * Why the task is waiting; `null` when it is executing or terminal.
+	 *
+	 * The reason is derived from queue state, never guessed from availability.
+	 */
+	waitReason: WaitReason | null;
+	/**
+	 * Queue/hold record ids backing `waitReason`.
+	 *
+	 * For a pool wait these are the WorkBuddy session ids that block the
+	 * round; for a scope conflict it is the occupying work id.
+	 */
+	blockerIds: string[];
+	/**
+	 * The per-session facts behind a pool wait.
+	 *
+	 * Empty for every other kind of wait: only a pool decides among
+	 * sessions, so only a pool has sessions to report.
+	 */
+	sessionBlockers: SessionBlocker[];
 }
 
 /** A single planned external action in a task goal. */
@@ -156,6 +220,18 @@ export interface TaskRequest {
 	inputFiles?: string[];
 	expectedOutputs?: string[];
 	taskId?: string;
+	/**
+	 * The model's claim that the user's own message asked for WorkBuddy.
+	 *
+	 * Only the tool's caller sees the conversation, so this is a declaration, not
+	 * something the tool can verify — the plugin receives parameters, never the
+	 * user's words. It is treated as advisory: true means "ask before choosing a
+	 * route for an overlapping deliverable", absent means "the model's own idea, so
+	 * delegate without a routing question". Both failure modes are mild (an extra
+	 * prompt, or a delegation the user wanted anyway), which is why an unverified
+	 * flag is acceptable here where an unverified approval would not be.
+	 */
+	requestedByUser?: boolean;
 }
 
 /** Explicit human confirmation authorizing a task round to execute. */
@@ -256,6 +332,15 @@ export interface DesktopCandidate {
 	binding: Binding;
 	/** True when another client currently holds the session's writer. */
 	busy: boolean;
+	/**
+	 * The working directory the worker itself reports, when known.
+	 *
+	 * `binding.projectRoot` names the project the candidate was discovered
+	 * *for*, which is this project for every candidate of one discovery run. The
+	 * worker's own directory is what proves which project the session actually
+	 * serves, so it is the field a pool must compare.
+	 */
+	cwd?: string;
 }
 
 /** What a read-only inspection of one worker's auxiliary HTTP surface found. */
@@ -268,7 +353,7 @@ export interface WorkerInspection {
 	 * and a healthy worker. It says nothing about ACP compatibility, which is only
 	 * proven when a real delegation connects.
 	 */
-	status: "verified" | "busy" | "auth_required" | "mismatch" | "unhealthy" | "unknown";
+	status: "verified" | "busy" | "auth_required" | "mismatch" | "unhealthy" | "unknown" | "unreachable";
 	workbuddyVersion: string | null;
 }
 
@@ -377,15 +462,73 @@ export class WbTaskError extends Error {
 // ---------------------------------------------------------------------------
 
 /** Lifecycle state of one delegated task under the persistent-queue model. */
-export type TaskStatusV3 =
-	| "queued"
-	| "running"
-	| "awaiting_approval"
-	| "awaiting_help"
-	| "completed"
-	| "failed"
-	| "cancelled"
-	| "interrupted";
+/** The queue model shares the task-status vocabulary; kept as an alias. */
+export type TaskStatusV3 = TaskStatus;
+
+/**
+ * Why one enrolled WorkBuddy session cannot take a task right now.
+ *
+ * These are the *per-session* facts behind a pool wait. They are distinct from
+ * the wait reason itself: the reason is the single sentence a user acts on,
+ * while these say which session is busy, which one is not answering, and which
+ * one is already spoken for.
+ */
+export type SessionBlockerReason =
+	/** The session is running another task. */
+	| "session_busy"
+	/** The session is offline, or nothing proves a live worker owns it. */
+	| "session_unavailable"
+	/** The session already carried another task's work, so it is not clean. */
+	| "already_used_by_other_task"
+	/** The session's ownership of this project was disproved. */
+	| "ownership_conflict"
+	/** The session's native state is unknown, so it may not be reused. */
+	| "native_state_unknown";
+
+/** One session that blocks a queued round, and why. */
+export interface SessionBlocker {
+	sessionId: string;
+	reason: SessionBlockerReason;
+}
+
+/**
+ * Why a pool round is waiting; the host shows this to the user verbatim.
+ *
+ * The reasons name the *kind* of wait, so the advice that follows is the
+ * action that actually unblocks it. A mixed pool of busy and offline sessions
+ * is one wait with one action, and is named as such instead of being
+ * misreported as a pool that has been used up.
+ */
+export type PoolWaitReason =
+	/**
+	 * The project has no enrolled WorkBuddy session at all.
+	 *
+	 * The remedy is to open one; nothing about the pool's capacity is known
+	 * yet, so this says exactly that and claims nothing more.
+	 */
+	| "no_enrolled_session"
+	/**
+	 * Every enrolled session has already carried a task.
+	 *
+	 * A finished conversation is never reused for an unrelated one, so the
+	 * remedy is to open another session for this project.
+	 */
+	| "no_unused_session"
+	/** Every eligible session is busy right now. */
+	| "all_sessions_busy"
+	/** Every eligible session is offline or its state is unknown. */
+	| "sessions_unavailable"
+	/**
+	 * Some sessions are busy and others are not answering.
+	 *
+	 * This is a transient wait: the round runs as soon as one of them frees
+	 * up, and no new session is needed.
+	 */
+	| "sessions_busy_or_unavailable"
+	/** Every eligible session's ownership of this project was disproved. */
+	| "ownership_conflict"
+	/** Every eligible session's native state is unknown. */
+	| "native_state_unknown";
 
 /**
  * Why a task is waiting, derivable from queue state rather than guessed.
@@ -399,7 +542,8 @@ export type WaitReason =
 	| "session_unavailable"
 	| "owner_unavailable"
 	| "programming_help"
-	| "native_state_unknown";
+	| "native_state_unknown"
+	| PoolWaitReason;
 
 /**
  * Where a round may execute.
@@ -416,7 +560,7 @@ export type TargetPolicy =
 export interface OwnerIdentity {
 	/** OMP session id from `ctx.sessionManager.getSessionId()`. */
 	sessionId: string;
-	/** New UUID per session switch; fencing compares generations, not names. */
+	/** Fresh UUID for this activation's ownership of one stable OMP session. */
 	generation: string;
 	processId: number;
 	/** UUID generated once per activation instance. */
@@ -551,6 +695,8 @@ export interface TaskViewV3 {
 	waitReason: WaitReason | null;
 	/** Queue/hold record ids backing `waitReason`. */
 	blockerIds: string[];
+	/** The per-session facts behind a pool wait; empty for every other wait. */
+	sessionBlockers: SessionBlocker[];
 	requestId: string;
 	commitState: CommitState;
 	reviewState: ReviewState;
@@ -607,4 +753,273 @@ export interface StagedTask {
 		payload: TaskManifestPayload;
 		approval: ManifestApproval;
 	};
+}
+
+/** Where a recorded authorization came from; never supplied by a model. */
+export type AuthorizationSource = "host_dialog" | "user_command";
+
+// ---------------------------------------------------------------------------
+// Criterion-level review and one-task correction (G06)
+// ---------------------------------------------------------------------------
+
+/** One acceptance criterion's verdict, as the reviewing OMP actually observed it. */
+export interface TaskReviewFinding {
+	criterion: string;
+	status: "passed" | "failed" | "blocked";
+	/** What was observed, in the reviewer's words. Never empty. */
+	note: string;
+	/** Concrete evidence references (a command, a diff, a file digest). */
+	evidence: string[];
+}
+
+/** One immutable review of one round's artifact byte set. */
+export interface TaskReviewRecord {
+	reviewId: string;
+	taskId: string;
+	round: number;
+	findings: TaskReviewFinding[];
+	verdict: "accepted" | "changes_requested" | "unverified";
+	artifacts: Array<{ path: string; sha256: string }>;
+	reviewer: OwnerIdentity;
+	reviewedAt: number;
+}
+
+/** The standing of the newest review against the bytes that are on disk now. */
+export interface EffectiveTaskReview {
+	review: TaskReviewRecord;
+	/**
+	 * True only when the verdict still describes the current bytes: every reviewed
+	 * artifact is present and unchanged.
+	 */
+	effective: boolean;
+	invalidation: "artifact_changed" | "artifact_missing" | null;
+}
+
+/** The frozen plan for a task's one automatic correction. */
+export interface CorrectionPlan {
+	version: 1;
+	taskId: string;
+	reviewId: string;
+	/** Round the review judged; the correction is the next round of the same task. */
+	baseRound: number;
+	targetRound: number;
+	/** Deterministic per (task, review), so a retry cannot create a second round. */
+	requestId: string;
+	/** Carries the original goal with the defect context appended; nothing else moves. */
+	request: TaskRequest;
+	/** Frozen bytes the correction must work from, project-relative with digests. */
+	inputs: { path: string; sha256: string }[];
+	/** The approval the correction continues, recorded so it can be revalidated. */
+	baseAuthorization: { requestId: string; manifestSha256: string; source: string; at: string; ownerSession: string };
+	failedCriteria: TaskReviewFinding[];
+}
+
+/** Result of reserving (or refusing) a task's one correction. */
+export type CorrectionReservation =
+	| { kind: "reserved"; plan: CorrectionPlan }
+	| { kind: "existing"; plan: CorrectionPlan }
+	| { kind: "needs_human"; reason: string };
+
+/** Stable identifiers are UUIDs so they survive restarts and cross-process use. */
+export type PackageId = string;
+export type TaskId = string;
+export type RequestId = string;
+export type AttemptId = string;
+export type ContinuationId = string;
+/**
+ * The exact subject one operator recovery act is about.
+ *
+ * Every field is a fact that identifies *one* round and nothing else: the
+ * round's own identity, the attempt that may have reached WorkBuddy, the
+ * session it ran on, the identity that owned it, the manifest the human
+ * approved and the first business outcome the queue recorded. A recovery that
+ * acts on a different subject is a different act, so the subject is frozen
+ * before the human is asked and compared again inside the commit.
+ *
+ * The subject is a snapshot, never a live view: it is read in one scope,
+ * closed, and only then compared.
+ */
+export interface RecoverySubject {
+	taskId: string;
+	round: number;
+	requestId: string;
+	/** The armed attempt, or `null` for a round that was never sent. */
+	attemptId: string | null;
+	/** The WorkBuddy session the round actually ran on. */
+	sessionId: string | null;
+	/** The identity that owned and executed the round. */
+	ownerSession: string;
+	ownerGeneration: string;
+	/** The executor instance of that owner generation. */
+	executorInstance: string;
+	/** Digest of the approved manifest the queue fenced on. */
+	manifestSha256: string;
+	/** Digest of the recorded first business outcome. */
+	outcomeSha256: string;
+	/**
+	 * Digest of the confirmed receipt, when the subject names one.
+	 *
+	 * A release acts on a *committed* receipt, so its subject names the digest
+	 * the queue already confirmed; a repair freezes before the receipt exists
+	 * and names nothing.
+	 */
+	receiptSha256: string | null;
+	/** The round's revision at the time the subject was frozen. */
+	revision: number;
+}
+
+/**
+ * One human's explicit, one-shot consent to a recovery act.
+ *
+ * The consent names the subject it was given for. A consent whose subject no
+ * longer matches the round is refused inside the transaction, because a human
+ * answered a question about *that* round and not about whatever the round
+ * became afterwards.
+ */
+export interface RecoveryConsent {
+	/** Exactly `true`; anything else (including a truthy non-boolean) is a refusal. */
+	confirmed: true;
+	/** ISO timestamp of the human's answer. */
+	at: string;
+	/** The subject the human was shown. */
+	subject: RecoverySubject;
+}
+
+/**
+ * The proof that an original execution owner is gone.
+ *
+ * A database row that says "inactive" is a declaration; it is not proof. The
+ * owner's registered OS process must also be gone. Only both together make a
+ * recovery by somebody else lawful.
+ */
+export interface OwnerDeathProof {
+	/** The original owner's session id. */
+	sessionId: string;
+	generation: string;
+	instanceId: string;
+	/** The OS process id the owner registered. */
+	processId: number;
+	/** How the owner's registration ended. */
+	state: "inactive" | "dead";
+	/** True when the OS proved that process id no longer exists. */
+	pidGone: true;
+	/** When the proof was taken. */
+	provedAt: number;
+}
+
+/**
+ * Authorization to recover a round whose original owner is gone.
+ *
+ * This is the only way a *different* operator may act on a round. It carries
+ * the actual operator, the immutable original owner, the exact subject, the
+ * human's consent and the death proof — and the queue checks all of it inside
+ * the commit transaction, so a forged or stale grant cannot commit anything.
+ */
+export interface OperatorRecoveryAuthorization {
+	kind: "operator_recovery";
+	/** The operator who is actually performing the recovery right now. */
+	operator: OwnerIdentity;
+	/** The original owner, unchanged by the recovery. */
+	originalOwner: OwnerIdentity;
+	/** Proof that the original owner's process is gone. */
+	deathProof: OwnerDeathProof;
+	/** The exact subject the human consented to. */
+	subject: RecoverySubject;
+	/** The human's one-shot consent for that subject. */
+	consent: RecoveryConsent;
+	/** When the operator asked the human. */
+	requestedAt: number;
+}
+
+/**
+ * Who is authorized to commit one round's receipt.
+ *
+ * The ordinary path is the round's own owner: it needs no extra grant, because
+ * the round's owner row is already the authority. The recovery path is a
+ * different human acting on a round whose original owner is provably gone,
+ * and it carries its own explicit, one-shot authorization.
+ *
+ * The two are different shapes on purpose: a recovery can never be expressed
+ * as "a host dialog said yes".
+ */
+export type ReceiptAuthorization =
+	| { kind: "owner"; owner: OwnerIdentity }
+	| { kind: "operator_recovery"; recovery: OperatorRecoveryAuthorization };
+
+/**
+ * Authorization to release one quarantined execution.
+ *
+ * Releasing is not the same act as repairing: it is the human's separate
+ * observation that the remote execution really stopped. It therefore carries
+ * its own end observation and its own one-shot consent, and it never accepts a
+ * repaired local receipt as proof that the worker stopped.
+ *
+ * The two variants are different acts, not two spellings of one:
+ *
+ *  - `owner_release`: the round's own originating session releases its own
+ *    round. Its authority is the round's owner row, exactly as it always was.
+ *  - `quarantine_release`: a *different* human releases a round whose original
+ *    owner is provably gone. It carries the exact subject and the one-shot
+ *    consent, and the queue checks them inside the release transaction.
+ */
+export type QuarantineReleaseAuthorization =
+	| {
+			kind: "owner_release";
+			/** The originating session's live identity. */
+			owner: OwnerIdentity;
+			/** The human's own end observation. */
+			verification: { source: "host_dialog"; at: string; evidence: string };
+	  }
+	| {
+			kind: "quarantine_release";
+			/** The operator who is actually performing the release right now. */
+			operator: OwnerIdentity;
+			/** The original owner of the round, unchanged by the release. */
+			originalOwner: OwnerIdentity;
+			/** Proof that the original owner's process is gone, when it is not the operator. */
+			deathProof: OwnerDeathProof | null;
+			/** The exact subject the human consented to. */
+			subject: RecoverySubject;
+			/** The human's one-shot consent for that subject. */
+			consent: RecoveryConsent;
+			/**
+			 * The human's explicit observation that the remote execution stopped.
+			 *
+			 * This is separate evidence from the receipt: a committed local receipt
+			 * proves what the round *decided*, never that the worker stopped.
+			 */
+			endObservation: {
+				source: "host_dialog";
+				at: string;
+				evidence: string;
+			};
+			/** When the operator asked the human. */
+			requestedAt: number;
+	  };
+
+/** Everything one durable commit needs, independent of the host's task object. */
+export interface DurableCommitInput {
+	projectRoot: string;
+	taskId: string;
+	/** Round being committed. Supplemental rounds write and confirm their own row. */
+	round: number;
+	requestId: string;
+	/** The round as recorded on the receipt; its status is the outcome being committed. */
+	status: "completed" | "failed" | "cancelled" | "interrupted";
+	error: TaskError | null;
+	receiptSha256: string;
+	/**
+	 * Recovery authorization, rechecked inside the receipt transaction.
+	 * Ordinary terminal commits use the round's existing execution authority.
+	 */
+	authorization?: ReceiptAuthorization;
+	/** Ephemeral cancellation of a pending recovery; never persisted. */
+	signal?: AbortSignal;
+}
+
+/** What one durable commit did. */
+export interface DurableCommitResult {
+	committed: boolean;
+	/** Why it did not commit; `null` on success. */
+	reason: string | null;
 }

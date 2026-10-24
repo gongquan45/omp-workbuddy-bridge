@@ -1,8 +1,6 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile, stat, open } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, readdir, rm, writeFile, stat, open } from "node:fs/promises";
 import * as path from "node:path";
-import { realpath } from "node:fs/promises";
 import {
 	LOG_DEFAULT_RETENTION_DAYS,
 	LOG_FILE_MAX_BYTES,
@@ -18,27 +16,26 @@ import {
 	setLogWarnSink,
 } from "../src/logging";
 import { WB_ERROR_CODE } from "../src/types";
+import { createFixtureRoot, removeFixtureRoot } from "./helpers/fixtures";
 
 let root = "";
 /** Set only once a fixture root exists; guards the cleanup below. */
 let rootReady = false;
 
 beforeEach(async () => {
-	root = await realpath(await mkdtemp(path.join(tmpdir(), "wb-logging-")));
+	root = await createFixtureRoot("wb-logging-");
 	rootReady = true;
 	setLogInstanceId(crypto.randomUUID());
 });
 
 afterEach(async () => {
-	// Guard against a setup failure leaving root unset: rm("") would
-	// resolve against the process cwd, which for bun test is this repository.
-	if (!rootReady || !path.isAbsolute(root) || root.length < 8) {
+	if (!rootReady) {
 		return;
 	}
 	rootReady = false;
 	await closeLogWriter(root);
 	setLogWarnSink(null);
-	await rm(root, { recursive: true, force: true });
+	await removeFixtureRoot(root);
 });
 
 describe("bridge event log", () => {

@@ -43,6 +43,7 @@ export type BridgeEvent =
 	| "help.requested"
 	| "help.answered"
 	| "recovery.required"
+	| "receipt.repaired"
 	| "commit.failed";
 
 /** Optional correlation fields; only these may appear besides time/level/event. */
@@ -406,6 +407,18 @@ export async function logEvent(
 		),
 	);
 	await next;
+}
+
+/**
+ * Awaits every log write already queued for this root.
+ *
+ * The append chain never rejects, so this cannot fail: it reports only "the writes
+ * that were pending when you asked have been attempted". That is what a caller that
+ * needs the record on disk before proceeding should wait on — a timer would be a
+ * guess about how long a filesystem takes.
+ */
+export async function flushBridgeLogs(root: string): Promise<void> {
+	await (appendLocks.get(writerKey(root)) ?? Promise.resolve());
 }
 
 /** Records one failure episode and warns the host once, sanitized. */

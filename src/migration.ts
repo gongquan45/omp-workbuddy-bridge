@@ -15,9 +15,10 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readdir } from "node:fs/promises";
+import { mkdir, readdir } from "node:fs/promises";
 import * as path from "node:path";
-import { canonicalProjectRoot, initializeProjectDatabase, openReadConnection, openWriteConnection, withImmediate, readMeta, writeMeta, nextRevision, closeQueueConnection } from "./queue";
+import { Database } from "bun:sqlite";
+import { canonicalProjectRoot, ensureRoundsColumns, initializeProjectDatabase, openReadConnection, openWriteConnection, QUEUE_SCHEMA_VERSION, SCHEMA_SQL, splitSqlStatements, withImmediate, readMeta, writeMeta, nextRevision, closeQueueConnection } from "./queue";
 import { readAllWorkRecords } from "./collaboration";
 import { delegatedWorkId, isPidAlive, readBinding, readTask, readTaskLock, uuid5, WbTaskError } from "./tasks";
 import { WB_ERROR_CODE, type TaskReceipt } from "./types";
@@ -45,6 +46,15 @@ function legacySnapshotRoot(root: string, taskId: string): string {
 
 /** One issue recorded when old state could not be imported. */
 function recordIssue(db: import("bun:sqlite").Database, code: string, relativeSource: string, detail: string): void {
+	// Idempotent on (code, source): a schema upgrade re-runs the whole import,
+	// and the same unreadable file must not pile up a new issue row every time.
+	const existing = db
+		.query("SELECT id FROM issues WHERE code = ? AND relative_source = ?")
+		.get(code, relativeSource) as { id: string } | null;
+	if (existing !== null) {
+		db.run("UPDATE issues SET detail_json = ? WHERE id = ?", [JSON.stringify({ detail }), existing.id]);
+		return;
+	}
 	db.run("INSERT INTO issues(id, code, relative_source, detail_json) VALUES(?, ?, ?, ?)", [
 		crypto.randomUUID(),
 		code,
@@ -66,10 +76,14 @@ export async function migrateProjectToQueue(root: string): Promise<string> {
 	const dbPath = path.join(bridgeDir, "state.sqlite");
 
 	// A database that exists with the completion marker is fully migrated:
-	// nothing to do. A database WITHOUT the marker is a previous attempt that
-	// died mid-flight — it must be migrated into (or fail loudly), never
-	// mistaken for a finished migration. The gate check is read-only: the
-	// census below must stay the first thing this module writes.
+	// nothing to do — unless it still declares an older *schema* version, in
+	// which case the schema upgrade must still run. The two markers answer
+	// different questions: `migration_completed` says the file-based state was
+	// imported, `schema_version` says which shape the bytes have. A database
+	// WITHOUT the completion marker is a previous attempt that died mid-flight
+	// — it must be migrated into (or fail loudly), never mistaken for a
+	// finished migration. The gate check is read-only: the census below must
+	// stay the first thing this module writes.
 	if (existsSync(dbPath)) {
 		const existing = openReadConnection(canonicalRoot);
 		if (existing === null) {
@@ -79,7 +93,9 @@ export async function migrateProjectToQueue(root: string): Promise<string> {
 			);
 		}
 		try {
-			if (readMeta(existing, "migration_completed") !== null) {
+			const completed = readMeta(existing, "migration_completed") !== null;
+			const schema = readMeta(existing, "schema_version");
+			if (completed && schema === String(QUEUE_SCHEMA_VERSION)) {
 				return canonicalRoot;
 			}
 		} finally {
@@ -167,10 +183,21 @@ export async function migrateProjectToQueue(root: string): Promise<string> {
 	// The census runs before the database exists: an aborted migration (a live
 	// old owner, an unreadable project) leaves no state.sqlite behind, so the
 	// user is never told "nothing was touched" over a schema-complete file.
-	// openWriteConnection below is the first byte this module writes.
-	const db = openWriteConnection(canonicalRoot);
+	//
+	// Ordering from here on: snapshot the existing database (when there is one),
+	// then open it in upgrade mode, then rewrite it in one transaction. The
+	// snapshot is what makes an interrupted upgrade recoverable, and it must be
+	// taken before any schema change — `VACUUM INTO` produces a consistent copy
+	// even while the source is in WAL mode, unlike copying the file bytes.
+	const backup = await snapshotBeforeUpgrade(canonicalRoot);
+	const db = openWriteConnection(canonicalRoot, {
+		// Migration is the one caller allowed to open an older schema: refusing
+		// here would leave an upgrading project with no path forward at all.
+		allowSchemaMismatch: true,
+	});
 	try {
 		withImmediate(db, () => {
+			upgradeSchema(db, canonicalRoot);
 			initializeProjectDatabase(db, canonicalRoot);
 			// Authorization evidence comes from the binding: a project with
 			// history but no readable binding migrates as history-only, with
@@ -206,7 +233,13 @@ export async function migrateProjectToQueue(root: string): Promise<string> {
 				recordIssue(db, "binding_invalid", ".wb-bridge/binding.json", "Binding file could not be parsed; fix or remove it before dispatch.");
 			}
 			if (enabled) {
-				writeMeta(db, "project_enabled_at", new Date().toISOString());
+				// The enablement time is consent evidence: it says when the user
+				// authorized this project. A schema upgrade re-runs this import,
+				// and the original timestamp must survive it — rewriting it would
+				// make the consent look like it was given today.
+				if (readMeta(db, "project_enabled_at") === null) {
+					writeMeta(db, "project_enabled_at", new Date().toISOString());
+				}
 			}
 
 			// Receipt import: every history round becomes a legacy v3 row. The
@@ -235,6 +268,24 @@ export async function migrateProjectToQueue(root: string): Promise<string> {
 							status === "completed" || status === "cancelled" || status === "failed" ? "committed" : "pending",
 							round.consent ? Date.parse(round.consent.at) || Date.now() : Date.now(),
 						],
+					);
+					// The legacy round already ran in a real WorkBuddy context.
+					// That context is *used*: it holds the work of this task and
+					// must never be handed to an unrelated task. The row is
+					// recorded as used — not as a clean reservation — so the
+					// history is preserved truthfully instead of being
+					// back-dated into a fresh context.
+					db.run(
+						`INSERT OR IGNORE INTO session_usage(session_id, task_id, first_round, state, first_used_at)
+						 VALUES(?, ?, ?, 'used', ?)`,
+						[receipt.sessionId, taskId, round.number, Date.now()],
+					);
+					// The same fact, expressed as the task's durable affinity: the
+					// old context is where this task's work lives.
+					db.run(
+						`INSERT OR IGNORE INTO task_sessions(task_id, session_id, round, kind, assigned_at, updated_at)
+						 VALUES(?, ?, ?, 'pinned', ?, ?)`,
+						[taskId, receipt.sessionId, round.number, Date.now(), Date.now()],
 					);
 					// Legacy input hashes are unknown when the receipt predates
 					// hashing; snapshot paths are stored relative to the round's
@@ -351,7 +402,14 @@ export async function migrateProjectToQueue(root: string): Promise<string> {
 			// The completion marker lands inside the same transaction as the
 			// imports: a committed database is always a migrated database, and
 			// anything that failed rolls back to an empty file for the retry.
-			writeMeta(db, "migration_completed", new Date().toISOString());
+			//
+			// A schema upgrade re-runs this import against a database that is
+			// already migrated, so the original marker is kept: the time the
+			// project was migrated is history, not something the upgrade may
+			// rewrite.
+			if (readMeta(db, "migration_completed") === null) {
+				writeMeta(db, "migration_completed", new Date().toISOString());
+			}
 		});
 	} catch (err: unknown) {
 		throw new WbTaskError(
@@ -368,6 +426,171 @@ export async function migrateProjectToQueue(root: string): Promise<string> {
  * same workId as a same-id receipt round where one exists.
  */
 
+
+/**
+ * Copies the existing database to a per-migration backup directory.
+ *
+ * Returns the backup path, or `null` when there is nothing to upgrade yet (a
+ * first-time migration writes into a file that does not exist). The copy is
+ * verified by re-reading it, so a truncated backup is reported instead of being
+ * silently relied on.
+ */
+async function snapshotBeforeUpgrade(root: string): Promise<string | null> {
+	const source = path.join(root, ".wb-bridge", "state.sqlite");
+	if (!existsSync(source)) {
+		return null;
+	}
+	const migrationId = crypto.randomUUID();
+	const directory = path.join(root, ".wb-bridge", "backups", migrationId);
+	await mkdir(directory, { recursive: true });
+	const target = path.join(directory, "db-before.sqlite");
+	const source_db = new Database(source, { readonly: true });
+	try {
+		source_db.run("PRAGMA busy_timeout = 5000");
+		// A consistent copy, including WAL contents, without assuming any Bun-only
+		// backup API: `VACUUM INTO` is plain SQLite.
+		source_db.run("VACUUM INTO ?", [target]);
+	} finally {
+		// This handle is discarded here, so its statements are finalized with
+		// it: `close(false)` would keep the file locked until the garbage
+		// collector runs, which on Windows is exactly when the project
+		// directory could be removed.
+		source_db.close(true);
+	}
+	// Read the copy back: an unreadable backup must fail the migration now, not
+	// when someone needs it.
+	const check = new Database(target, { readonly: true });
+	try {
+		const version = readMeta(check, "schema_version");
+		if (version === null) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.storageError,
+				`Migration backup at ${target} does not declare a schema version; refusing to upgrade ${root}`,
+			);
+		}
+	} finally {
+		check.close(true);
+	}
+	return target;
+}
+
+/**
+ * Brings an existing database up to the current schema version.
+ *
+ * Runs inside the migration transaction, so a failure leaves the previous file
+ * untouched. New tables are created idempotently; the version marker is written
+ * last so a half-applied upgrade never claims to be complete.
+ */
+function upgradeSchema(db: Database, root: string): void {
+	const declared = readMeta(db, "schema_version");
+	if (declared === String(QUEUE_SCHEMA_VERSION)) {
+		return;
+	}
+	// A database written by a *newer* build is not this build's to rewrite. The
+	// additive statements below would happily "upgrade" a version 99 file back
+	// to version 3 and quietly drop whatever that version added, so a future
+	// schema is refused instead: the project must be opened by a build that
+	// understands it.
+	const declaredVersion = declared === null ? Number.NaN : Number.parseInt(declared, 10);
+	if (Number.isFinite(declaredVersion) && declaredVersion > QUEUE_SCHEMA_VERSION) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.migrationRequired,
+			`Project state database at ${root} declares schema version ${declared}, which is newer than this build understands (${QUEUE_SCHEMA_VERSION}); upgrade the bridge instead of migrating it backwards`,
+		);
+	}
+	// Every v2 table is additive: no existing column changes meaning, so applying
+	// the schema statements is the whole upgrade. Rows keep their `legacy` record
+	// kind, and no authorization is invented for them.
+	for (const statement of splitSqlStatements(SCHEMA_SQL)) {
+		const sql = statement.trim();
+		if (sql.length > 0) {
+			db.run(sql);
+		}
+	}
+	// New tables are created by the statements above, but added columns are not:
+	// `CREATE TABLE IF NOT EXISTS` leaves an existing table untouched. Without
+	// this, an upgraded database would silently lack every v2 round column while
+	// a fresh one has them.
+	ensureRoundsColumns(db);
+	// The v3 pool adds two tables and two roster columns. The backfill below
+	// gives every round that already ran a concrete context its durable
+	// affinity and its usage record, so an upgraded project does not pretend
+	// that a used conversation is clean.
+	backfillContextIsolation(db);
+	const violations = db.query("PRAGMA foreign_key_check").all();
+	if (violations.length > 0) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.storageError,
+			`Upgrading ${root} would violate ${violations.length} foreign key constraint(s); the previous database is unchanged`,
+		);
+	}
+	writeMeta(db, "schema_version", String(QUEUE_SCHEMA_VERSION));
+}
+
+/**
+ * Gives every round that already ran a context its durable affinity and its
+ * usage record.
+ *
+ * The upgrade must not pretend that a conversation which already carried a
+ * task is clean: if the old rows are left alone, the new pool would hand that
+ * conversation to an unrelated task and mix two tasks into one transcript.
+ *
+ * The rule is conservative on purpose:
+ *
+ *  - a round with a concrete `selected_session` really did run there, so the
+ *    context is *used* and the task is pinned to it;
+ *  - a round that only names a session in its target policy but never selected
+ *    one was never dispatched (or its selection was cleared by a rollback), so
+ *    it is pinned to that context but recorded as *reserved*, not used;
+ *  - a round with no concrete context at all keeps no affinity, because there
+ *    is nothing to pin it to.
+ */
+function backfillContextIsolation(db: Database): void {
+	const rows = db
+		.query(
+			`SELECT task_id, round, selected_session, target_policy_json, dispatch_state, status
+			 FROM rounds ORDER BY task_id ASC, round ASC`,
+		)
+		.all() as Array<{
+		task_id: string;
+		round: number;
+		selected_session: string | null;
+		target_policy_json: string;
+		dispatch_state: string;
+		status: string;
+	}>;
+	for (const row of rows) {
+		const selected = typeof row.selected_session === "string" ? row.selected_session : null;
+		let policySession: string | null = null;
+		try {
+			const policy = JSON.parse(row.target_policy_json) as { kind?: string; sessionId?: string };
+			if (policy.kind === "session" && typeof policy.sessionId === "string") {
+				policySession = policy.sessionId;
+			}
+		} catch {
+			// A malformed policy is left alone: it cannot name a context, and
+			// inventing one would be worse than recording nothing.
+			policySession = null;
+		}
+		const sessionId = selected ?? policySession;
+		if (sessionId === null) {
+			continue;
+		}
+		// A round that was armed or ended definitely used its context; a round
+		// that never left only reserved it.
+		const state = row.dispatch_state === "not_sent" ? "reserved" : "used";
+		db.run(
+			`INSERT OR IGNORE INTO session_usage(session_id, task_id, first_round, state, first_used_at)
+			 VALUES(?, ?, ?, ?, ?)`,
+			[sessionId, row.task_id, row.round, state, Date.now()],
+		);
+		db.run(
+			`INSERT OR IGNORE INTO task_sessions(task_id, session_id, round, kind, assigned_at, updated_at)
+			 VALUES(?, ?, ?, 'pinned', ?, ?)`,
+			[row.task_id, sessionId, row.round, Date.now(), Date.now()],
+		);
+	}
+}
 
 /** Lists task ids under the project's tasks directory. */
 async function listTaskIds(root: string): Promise<string[]> {

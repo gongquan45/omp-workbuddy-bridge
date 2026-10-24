@@ -9,25 +9,27 @@
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { connect, type ConnectOptions } from "../src/desktop-client";
 import type { DesktopSessionUpdate } from "../src/types";
 import { WB_ERROR_CODE } from "../src/types";
+import { createFixtureRootSync, removeFixtureRoot } from "./helpers/fixtures";
 
 const temporaryDirs: string[] = [];
 
 function makeTempDir(): string {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wb-bridge-acp-"));
+	const dir = createFixtureRootSync("wb-bridge-acp-");
 	temporaryDirs.push(dir);
 	return dir;
 }
 
-afterEach(() => {
+afterEach(async () => {
 	while (temporaryDirs.length > 0) {
 		const dir = temporaryDirs.pop();
 		if (dir !== undefined) {
-			fs.rmSync(dir, { recursive: true, force: true });
+			// The helper proves ownership before deleting; it never falls back to a
+			// path heuristic, so a wrong fixture fails instead of removing a directory.
+			await removeFixtureRoot(dir);
 		}
 	}
 });
@@ -281,12 +283,20 @@ class AcpFixture {
 	}
 }
 
-/** Registers a fixture's endpoint as the live worker for a project. */
+/**
+ * Registers a fixture's endpoint as the live worker for a project.
+ *
+ * The pid is the fixture's own, and it is the same pid the socket-owner map
+ * below names: an endpoint may only reach the ACP handshake when the process
+ * that owns its socket is proven to be the worker this record describes.
+ */
+const FIXTURE_WORKER_PID = 7000;
+
 function registerFixture(fixture: AcpFixture, sessionsDir: string, sessionId: string, cwd: string): void {
 	fs.mkdirSync(sessionsDir, { recursive: true });
 	fs.writeFileSync(
-		path.join(sessionsDir, "7000.json"),
-		JSON.stringify({ pid: 7000, sessionId, cwd, endpoint: fixture.endpoint }),
+		path.join(sessionsDir, `${FIXTURE_WORKER_PID}.json`),
+		JSON.stringify({ pid: FIXTURE_WORKER_PID, sessionId, cwd, kind: "interactive", endpoint: fixture.endpoint }),
 	);
 }
 
@@ -304,12 +314,16 @@ async function connectFixture(fixture: AcpFixture, sessionId: string, projectRoo
 	const logsDir = makeTempDir();
 	registerFixture(fixture, sessionsDir, sessionId, projectRoot);
 	// Endpoint recovery is disabled: these tests supply their own worker, and the
-	// host's real sockets must never influence the result.
+	// host's real sockets must never influence the result. The socket-owner map
+	// is stated explicitly for the same reason — the ownership proof must come
+	// from the test, never from the host's real process table.
 	const options: ConnectOptions = {
 		sessionsDir,
 		logsDir,
 		fetchTimeoutMs: 2_000,
 		locateEndpoints: async () => [],
+		locatePortOwners: () => new Map([[Number(new URL(fixture.endpoint).port), FIXTURE_WORKER_PID]]),
+		isOwnerAlive: () => true,
 	};
 	return await connect(
 		{ version: 1, projectRoot, sessionId, workbuddyVersion: "5.8.2" },

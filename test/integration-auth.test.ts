@@ -1,13 +1,13 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rm, readFile, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import activate, { type BridgeOverrides } from "../src/index";
 import { closeQueueConnection, readProjectAccess } from "../src/queue";
 import { WbTaskError } from "../src/tasks";
-import { WB_ERROR_CODE } from "../src/types";
+import { WB_ERROR_CODE, type Binding, type DesktopSession } from "../src/types";
+import { createFixtureRoot, removeFixtureRoot } from "./helpers/fixtures";
 
 interface RegisteredTool {
 	name: string;
@@ -33,17 +33,33 @@ beforeEach(() => {
 	testDirs = [];
 });
 
+/**
+ * The shutdown of every activation this file started.
+ *
+ * A real host ends the session, and the activation's own background work —
+ * publishing a result fact, delivering a result, advancing the queue — is
+ * finished by that shutdown. The fixture's files may only be removed once it
+ * has run: a background write still in flight would hold the project open.
+ */
+const activations: Array<() => Promise<void>> = [];
+
 afterEach(async () => {
+	while (activations.length > 0) {
+		const stop = activations.pop();
+		if (stop !== undefined) {
+			await stop();
+		}
+	}
 	for (const dir of testDirs) {
 		closeQueueConnection(dir);
 		closeQueueConnection(dir, "read");
-		await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+		await removeFixtureRoot(dir);
 	}
 	testDirs = [];
 });
 
 async function createProjectRoot(): Promise<string> {
-	const dir = await realpath(await mkdtemp(path.join(os.tmpdir(), "wb-auth-test-")));
+	const dir = await createFixtureRoot("wb-auth-test-");
 	testDirs.push(dir);
 	return dir;
 }
@@ -51,7 +67,18 @@ async function createProjectRoot(): Promise<string> {
 function makeMockApi(overrides: BridgeOverrides = {}) {
 	const commands = new Map<string, RegisteredCommand>();
 	const tools = new Map<string, RegisteredTool>();
-	const chain = {
+
+	/**
+	 * The activation's shutdown handler, captured so the test can shut the
+	 * activation down before its project's files are removed.
+	 */
+	let shutdown: (() => Promise<void>) | null = null;
+	// The teardown waits for the activation's background work through the
+	// shutdown, so the project's files are never removed while a background
+	// write is still in flight.
+	activations.push(async () => {
+		await shutdown?.();
+	});	const chain = {
 		describe: () => chain,
 		strict: () => chain,
 		optional: () => chain,
@@ -60,6 +87,7 @@ function makeMockApi(overrides: BridgeOverrides = {}) {
 		zod: {
 			string: () => chain,
 			number: () => chain,
+			boolean: () => chain,
 			array: () => chain,
 			enum: () => chain,
 			object: () => chain,
@@ -70,7 +98,11 @@ function makeMockApi(overrides: BridgeOverrides = {}) {
 			warn: () => undefined,
 			error: () => undefined,
 		},
-		on: () => undefined,
+		on: (event: string, handler: () => Promise<void>) => {
+			if (event === "session_shutdown") {
+				shutdown = handler;
+			}
+		},
 		registerCommand: (name: string, command: unknown) => {
 			if (typeof command === "object" && command !== null && "handler" in command) {
 				commands.set(name, command as RegisteredCommand);
@@ -87,14 +119,20 @@ function makeMockApi(overrides: BridgeOverrides = {}) {
 	return { commands, tools };
 }
 
-function makeMockContext(cwd: string, options: { pickedLabel?: string | null; pickedIndex?: number } = {}) {
+function makeMockContext(cwd: string, options: { confirmed?: boolean } = {}) {
 	const notifications: Array<{ message: string; type?: string }> = [];
 	// Records every selection prompt so a test can prove the candidate list was
 	// actually presented, not silently skipped.
 	const selections: Array<{ prompt: string; choices: string[] }> = [];
+	// Records every confirmation, so a test can prove the enrollment question
+	// was really asked.
+	const confirmations: string[] = [];
 	const ctx = {
 		cwd,
 		hasUI: true,
+		// A real host always provides the session id: the queue's owner identity
+		// is derived from it, so a delegation cannot be dispatched without one.
+		sessionManager: { getSessionId: () => "omp-integration-auth" },
 		ui: {
 			notify: (message: string, type?: string) => {
 				notifications.push({ message, type });
@@ -106,22 +144,21 @@ function makeMockContext(cwd: string, options: { pickedLabel?: string | null; pi
 				if (prompt.includes("Apply MCP configuration")) {
 					return "Apply MCP configuration";
 				}
-				if (prompt.includes("Bind this project")) {
-					if (options.pickedLabel === null) {
-						return undefined;
-					}
-					if (typeof options.pickedIndex === "number") {
-						return choices[options.pickedIndex];
-					}
-					return options.pickedLabel;
-				}
 				return choices[0];
 			},
-			confirm: async () => true,
+			confirm: async (prompt: string) => {
+				confirmations.push(prompt);
+				// The MCP configuration keeps its original answer; the enrollment
+				// consent is the one a test steers.
+				if (prompt.includes("Apply MCP configuration")) {
+					return true;
+				}
+				return options.confirmed ?? true;
+			},
 			setStatus: () => undefined,
 		},
 	} as unknown as ExtensionCommandContext;
-	return { ctx, notifications, selections };
+	return { ctx, notifications, selections, confirmations };
 }
 
 describe("authorization gate & setup integration", () => {
@@ -176,9 +213,21 @@ describe("authorization gate & setup integration", () => {
 						sessionId,
 						workbuddyVersion: "5.8.2",
 					},
+					cwd: projectRoot,
 					busy: false,
 				},
 			],
+			// The project is enrolled and enabled, so this call really dispatches.
+			// A worker stub answers it instead of the real desktop, so the case
+			// stays about the authorization gate and not about a live worker.
+			connect: async (binding) =>
+				({
+					binding,
+					prompt: async () => ({ stopReason: "end_turn" }),
+					respondToPermission: async () => undefined,
+					cancel: async () => undefined,
+					close: async () => undefined,
+				}) as unknown as DesktopSession,
 		});
 
 		const { ctx } = makeMockContext(projectRoot);
@@ -237,6 +286,10 @@ describe("authorization gate & setup integration", () => {
 
 		const { commands } = makeMockApi({
 			workbuddyHomeDir: path.join(projectRoot, ".test-home"),
+			// Setup probes sessions before migrating; without this the test reads the
+			// real user home and the Windows socket fallback, which no unit test may
+			// touch. An empty roster is also the honest fixture for a fresh project.
+			discover: async () => [],
 			migrateProject: async () => {
 				throw new WbTaskError(WB_ERROR_CODE.migrationRequired, migrationMessage);
 			},
@@ -316,7 +369,7 @@ describe("enable path: empty pool and explicit session choice", () => {
 		expect(existsSync(path.join(projectRoot, ".wb-bridge", "binding.json"))).toBe(false);
 	});
 
-	it("7. a cancelled session picker writes no binding but still enables the project", async () => {
+	it("7. a declined enrollment writes no binding but still enables the project", async () => {
 		const projectRoot = await createProjectRoot();
 		const written: string[] = [];
 		const ids = ["33333333-4444-4555-8666-777777777777", "44444444-5555-4666-8777-888888888888"];
@@ -332,22 +385,23 @@ describe("enable path: empty pool and explicit session choice", () => {
 				written.push(binding.sessionId);
 			},
 		});
-		const { ctx, selections } = makeMockContext(projectRoot, { pickedLabel: null });
+		const { ctx, confirmations } = makeMockContext(projectRoot, { confirmed: false });
 
 		await commands.get("wb")!.handler("setup", ctx as unknown as ExtensionCommandContext);
 
-		// The picker really was presented: an empty `selections` would mean the
-		// code skipped the choice entirely, which is a different bug from a cancel.
-		expect(selections.some((s) => s.prompt.includes("Bind this project"))).toBe(true);
+		// The question really was asked: an empty `confirmations` would mean the
+		// code skipped the decision entirely, which is a different bug from a
+		// decline.
+		expect(confirmations.some((prompt) => prompt.includes("Enroll this project's WorkBuddy sessions"))).toBe(true);
 		expect(written).toHaveLength(0);
 		const access = await readProjectAccess(projectRoot);
 		expect(access!.enabled).toBe(true);
 		expect(access!.migrated).toBe(true);
 	});
 
-	it("8. picking the second candidate binds that exact session", async () => {
+	it("8. consenting to the enrollment binds every verified session of the project", async () => {
 		const projectRoot = await createProjectRoot();
-		const written: string[] = [];
+		const written: Binding[] = [];
 		const ids = ["55555555-6666-4777-8888-999999999999", "66666666-7777-4888-8999-aaaaaaaaaaaa"] as const;
 		const candidates = ids.map((id) => ({
 			endpoint: "http://127.0.0.1:1234",
@@ -358,18 +412,20 @@ describe("enable path: empty pool and explicit session choice", () => {
 			workbuddyHomeDir: path.join(projectRoot, ".test-home"),
 			discover: async () => candidates,
 			writeBinding: async (binding) => {
-				written.push(binding.sessionId);
+				written.push(binding);
 			},
 		});
-		const { ctx } = makeMockContext(projectRoot, { pickedIndex: 1 });
+		const { ctx } = makeMockContext(projectRoot, { confirmed: true });
 
 		await commands.get("wb")!.handler("setup", ctx as unknown as ExtensionCommandContext);
 
-		// Proves the label-to-candidate mapping: a positional or numeric shortcut
-		// would bind the first candidate and still pass a single-candidate test.
-		const second = ids[1];
-		expect(second).toBeDefined();
-		expect(written).toEqual([second]);
+		// The enrollment is project-wide: both verified sessions are recorded, and
+		// the project keeps the consent so a restart enrolls later sessions
+		// without asking again.
+		expect(written).toHaveLength(1);
+		const roster = written[0]!.sessions ?? [];
+		expect(roster.map((member) => member.sessionId).sort()).toEqual([...ids].sort());
+		expect(written[0]!.autoBindProjectSessions).toBe(true);
 	});
 });
 

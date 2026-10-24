@@ -8,12 +8,21 @@
  * approved that one request.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { createHash } from "node:crypto";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import activate, { type BridgeOverrides } from "../src/index";
-import { currentRound } from "../src/tasks";
+import {
+	closeQueueConnection,
+	enableProject,
+	openReadConnection,
+	openProjectQueue,
+	readRound,
+	readRoundResources,
+} from "../src/queue";
+import { migrateProjectToQueue } from "../src/migration";
+import { currentRound, hashManifestPayload } from "../src/tasks";
 import type {
 	DesktopCallbacks,
 	DesktopSession,
@@ -24,6 +33,7 @@ import type {
 	TaskStatus,
 } from "../src/types";
 import { WB_ERROR_CODE } from "../src/types";
+import { createFixtureRoot, releaseProjectFixture, removeFixtureRoot } from "./helpers/fixtures";
 
 export type LegacyTestReceipt = TaskReceipt & {
 	status: TaskStatus;
@@ -45,12 +55,27 @@ const SESSION_ID = "66666666-7777-4888-8999-aaaaaaaaaaaa";
  */
 let PROJECT_ROOT = "";
 const allocatedRoots: string[] = [];
+/** Extra project directories a test needs in addition to the bound root. */
+const otherProjects: string[] = [];
 
 afterEach(async () => {
+	while (otherProjects.length > 0) {
+		const extra = otherProjects.pop();
+		if (extra !== undefined) {
+			// Ownership-checked like every other fixture root.
+			await removeFixtureRoot(extra);
+		}
+	}
 	while (allocatedRoots.length > 0) {
 		const target = allocatedRoots.pop();
 		if (target !== undefined) {
-			await rm(target, { recursive: true, force: true }).catch(() => undefined);
+			// A task whose turn is still open keeps its queue handle until it finalizes,
+			// so teardown runs the real shutdown path first: that finalizes held tasks
+			// exactly as production does, and only then is the directory releasable.
+			await harness?.shutdownExtension().catch(() => undefined);
+			// Ownership-checked, and the queue handles this process opened for the
+			// project are closed first: an unregistered path fails instead of deleting.
+			await releaseProjectFixture(target);
 		}
 	}
 });
@@ -76,8 +101,14 @@ class MockWbTaskError extends Error {
 class Harness {
 	readonly tools = new Map<string, RegisteredTool>();
 	readonly captured: CapturedSession[] = [];
+	/** Messages this activation handed to the host, in order. */
+	readonly sent: Array<{
+		customType: unknown;
+		content: unknown;
+		display: unknown;
+		options: { deliverAs?: string; triggerTurn?: boolean } | undefined;
+	}> = [];
 	readonly written = new Map<string, LegacyTestReceipt>();
-	readonly released: string[] = [];
 	readonly commands = new Map<string, { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
 	artifacts: string[] = [];
 	missingOutputs: string[] = [];
@@ -93,8 +124,6 @@ class Harness {
 	 * stops the release, while the initial `running` write still succeeds.
 	 */
 	failTerminalWrite = false;
-	/** Fails every `releaseTask` call. */
-	failRelease = false;
 	/** Rejects every artifact scan, as an unreadable outputs directory would. */
 	failCollect = false;
 	/** Records the order of committed lifecycle stages. */
@@ -207,6 +236,13 @@ class Harness {
 	/** Registers the tools and returns the API the tests drive. */
 	start(): ExtensionAPI {
 		const overrides: BridgeOverrides = {
+			// These cases drive the lifecycle with a held turn; a real foreground window
+			// would spend its whole budget on every one of them. The default window itself
+			// is covered by the host-behaviour suite.
+			foregroundWaitMs: 0,
+			// Setup writes one global WorkBuddy entry; pointing the home at the fixture is
+			// what keeps this suite from ever touching the real user profile.
+			workbuddyHomeDir: path.join(PROJECT_ROOT, ".test-home"),
 			discover: async () => [
 				{
 					endpoint: "http://127.0.0.1:1234",
@@ -234,16 +270,18 @@ class Harness {
 				this.captured.push({ binding, callbacks, session });
 				return session;
 			},
-			prepareTask: async (binding, request, confirmation) => {
-				const roundNumber = request.taskId ? 2 : 1;
+			// The dispatch path stages before it can queue or send, so the harness
+			// supplies a controllable stage: the receipt it records here is what later
+			// assertions read, and the brief path is where the prompt text comes from.
+			stageTask: async (_root, confirmation, request, taskId, round) => {
 				const receipt: TaskReceipt = {
 					version: 2,
-					taskId: request.taskId ?? TASK_ID,
-					sessionId: binding.sessionId,
-					projectRoot: binding.projectRoot,
+					taskId,
+					sessionId: confirmation.owner.sessionId,
+					projectRoot: _root,
 					rounds: [
 						{
-							number: roundNumber,
+							number: round,
 							layout: "round",
 							goal: request.goal ?? {
 								objective: "test prompt",
@@ -258,10 +296,7 @@ class Harness {
 							summary: "",
 							error: null,
 							artifacts: [],
-							consent: {
-								source: confirmation?.source ?? "host_dialog",
-								at: confirmation?.at ?? new Date().toISOString(),
-							},
+							consent: { source: confirmation.source, at: confirmation.at },
 						},
 					],
 				};
@@ -276,12 +311,90 @@ class Harness {
 					get inputFiles() { return current.inputFiles.map((i) => i.path); },
 					get expectedOutputs() { return current.expectedOutputs; },
 				} as unknown as LegacyTestReceipt;
-				this.written.set(receipt.taskId, stored);
+				this.written.set(taskId, stored);
+				this.lastTaskId = taskId;
+
+				// The queue verifies the staged manifest by reading it and recomputing the
+				// digest, so the double has to produce a real file whose payload hashes to
+				// the confirmed value. Handing back a path without bytes would test the
+				// harness instead of the gate.
+				const roundDir = path.join(_root, ".wb-bridge", "tasks", taskId, "rounds", String(round));
+				const payload = {
+					version: 1 as const,
+					projectRoot: _root,
+					requestId: confirmation.requestId,
+					taskId,
+					round,
+					owner: confirmation.owner,
+					goal: current.goal,
+					targetPolicy: confirmation.targetPolicy,
+					expectedOutputs: current.expectedOutputs,
+					inputs: [],
+					deliveryMode: confirmation.deliveryMode,
+				};
+				const manifestPath = path.join(roundDir, "manifest.json");
+				await mkdir(roundDir, { recursive: true });
+
+				await writeFile(
+					manifestPath,
+					JSON.stringify(
+						{
+							payload,
+							approval: {
+								source: confirmation.source,
+								at: confirmation.at,
+								payloadSha256: hashManifestPayload(payload),
+							},
+						},
+						null,
+						2,
+					),
+					"utf-8",
+				);
 				return {
-					receipt,
-					round: roundNumber,
-					briefPath: `${binding.projectRoot}/.wb-bridge/tasks/${receipt.taskId}/brief.md`,
-					outputsDir: `${binding.projectRoot}/.wb-bridge/tasks/${receipt.taskId}/outputs`,
+					snapshotRoot: roundDir,
+					manifestPath,
+					manifestSha256: hashManifestPayload(payload),
+					manifest: {
+						payload,
+						approval: {
+							source: confirmation.source,
+							at: confirmation.at,
+							payloadSha256: hashManifestPayload(payload),
+						},
+					},
+				};
+			},
+			// The harness expresses the binding relationship through stubs; the
+			// resolver is stubbed with the same value so `requireBinding` compares
+			// like with like instead of resolving real project state that this suite
+			// deliberately does not lay down. The real resolver has its own suite.
+			// The `authorization` value tracks `bindingRoot` so a test that clears
+			// the binding root also observes the refusal path it is asserting.
+			resolveProjectContext: async (cwd: string) => {
+				// Only the bound root is authorized; any other cwd is a different
+				// project that this harness has no state for, which is exactly what
+				// the "unbound folder" case exercises.
+				//
+				// A cwd that does not exist is a resolution *failure*, not an
+				// unauthorized-but-real directory: read-only tools must report it as a
+				// storage problem rather than describing a directory that is not there.
+				const exists = await stat(cwd).then(
+					(info) => info.isDirectory(),
+					() => false,
+				);
+				if (!exists) {
+					throw new MockWbTaskError("WB_INPUT_INVALID", `Project working directory could not be resolved: ${cwd}`);
+				}
+				const authorized = this.bindingRoot !== "" && cwd === this.bindingRoot;
+				return {
+					projectRoot: authorized ? this.bindingRoot : null,
+					actualCwd: cwd,
+					relativeCwd: "",
+					authorization: authorized ? "authorized" : "unauthorized",
+					identitySource: authorized ? "session_association" : "none",
+					ambiguousRoots: [],
+					reason: authorized ? null : `no project state covers ${cwd}`,
 				};
 			},
 			readBinding: async () =>
@@ -372,22 +485,46 @@ class Harness {
 					workbuddyVersion: worker.workbuddyVersion,
 				}));
 			},
-			writeTask: async (receipt) => {
-				const current = currentRound(receipt);
+			// The queue-backed commit writes a v3 per-round receipt. The double keeps the
+			// same observable behaviours as the v2 write (record it, fail on demand, make
+			// it visible to a later listing) and additionally writes the real file, since
+			// confirmReceipt re-reads it and verifies the digest against the bytes.
+			writeRoundReceipt: async (projectRoot, taskId, round, _layout, receipt) => {
+				const record = receipt as { rounds: Array<Record<string, unknown>> };
+				const entry = record.rounds[0]!;
+				const status = String(entry["status"]);
 				const isTerminal =
-					current.status === "completed" ||
-					current.status === "cancelled" ||
-					current.status === "failed" ||
-					current.status === "interrupted";
+					status === "completed" || status === "cancelled" || status === "failed" || status === "interrupted";
 				if (isTerminal) {
-					this.events.push(`write:${current.status}`);
+					this.events.push(`write:${status}`);
 					if (this.failTerminalWrite) {
 						this.failTerminalWrite = false;
 						throw new Error("simulated disk failure");
 					}
 				}
+				const flat: TaskReceipt = {
+					version: 2,
+					taskId,
+					sessionId: String(record.rounds[0]!["owner"] ?? "") === "" ? "" : String((record.rounds[0]!["owner"] as { sessionId?: string })?.sessionId ?? ""),
+					projectRoot,
+					rounds: [
+						{
+							number: round,
+							layout: "round",
+							goal: entry["goal"] as TaskReceipt["rounds"][number]["goal"],
+							inputFiles: entry["inputFiles"] as TaskReceipt["rounds"][number]["inputFiles"],
+							expectedOutputs: entry["expectedOutputs"] as string[],
+							status: status as TaskReceipt["rounds"][number]["status"],
+							summary: String(entry["summary"] ?? ""),
+							error: (entry["error"] ?? null) as TaskReceipt["rounds"][number]["error"],
+							artifacts: (entry["artifacts"] ?? []) as TaskReceipt["rounds"][number]["artifacts"],
+							consent: (entry["consent"] ?? null) as TaskReceipt["rounds"][number]["consent"],
+						},
+					],
+				};
+				const current = currentRound(flat);
 				const stored = {
-					...receipt,
+					...flat,
 					get status() { return current.status; },
 					get summary() { return current.summary; },
 					get error() { return current.error; },
@@ -396,25 +533,16 @@ class Harness {
 					get inputFiles() { return current.inputFiles.map((i) => i.path); },
 					get expectedOutputs() { return current.expectedOutputs; },
 				} as unknown as LegacyTestReceipt;
-				this.written.set(receipt.taskId, stored);
+				this.written.set(taskId, stored);
 				this.notifyUpdate();
-				// In a real project the receipt *is* the row the index reports, so a
-				// committed write is visible to a later listing.
-				const row = this.storedIndex.find((entry) => entry.taskId === receipt.taskId);
-				if (row === undefined) {
-					this.storedIndex.push({
-						taskId: receipt.taskId,
-						sessionId: receipt.sessionId,
-						round: current.number,
-						status: current.status,
-						updatedAt: Date.now(),
-					});
-				} else {
-					row.status = current.status;
-					row.sessionId = receipt.sessionId;
-					row.round = current.number;
-					row.updatedAt = Date.now();
-				}
+
+				const roundDir = path.join(projectRoot, ".wb-bridge", "tasks", taskId, "rounds", String(round));
+				const receiptPath = path.join(roundDir, "receipt.json");
+				const bytes = `${JSON.stringify(receipt, null, 2)}\n`;
+				await mkdir(roundDir, { recursive: true });
+				await writeFile(receiptPath, bytes, "utf-8");
+				const digest = createHash("sha256").update(bytes, "utf-8").digest("hex");
+				return { receiptPath, sha256: digest, bytes: Buffer.byteLength(bytes, "utf-8") };
 			},
 			collectArtifacts: async () => {
 				this.events.push("collect");
@@ -436,14 +564,6 @@ class Harness {
 				}));
 				return { artifacts: fileArtifacts, missingOutputs: this.missingOutputs };
 			},
-			releaseTask: async (_projectRoot, taskId) => {
-				this.events.push("release");
-				if (this.failRelease) {
-					throw new Error("simulated lock release failure");
-				}
-				this.released.push(taskId);
-				this.notifyUpdate();
-			},
 			// A real cancellation holds the connection for seconds; tests that hold a
 			// turn open would spend that budget on every case, so it is shortened
 			// here and the real budget is covered by the default itself.
@@ -456,6 +576,7 @@ class Harness {
 				object: (shape: unknown) => ({ ...(typeof shape === "object" && shape !== null ? shape : {}), describe: () => chain, optional: () => chain, strict: () => chain }),
 				string: () => chain,
 				number: () => chain,
+				boolean: () => chain,
 				array: () => chain,
 				enum: () => chain,
 			},
@@ -472,6 +593,17 @@ class Harness {
 			},
 			registerTool: (tool: RegisteredTool) => {
 				this.tools.set(tool.name, tool);
+			},
+			// The host hands a committed result to the conversation as a follow-up
+			// message. The fixture records it, exactly as the real host would, so a
+			// delivery that cannot happen is visible instead of silent.
+			sendMessage: (message: Record<string, unknown>, options?: { deliverAs?: string; triggerTurn?: boolean }) => {
+				this.sent.push({
+					customType: message["customType"],
+					content: message["content"],
+					display: message["display"],
+					options,
+				});
 			},
 		};
 		const extensionApi = api as unknown as ExtensionAPI;
@@ -510,6 +642,7 @@ class Harness {
 					inputFiles: p.inputFiles,
 					expectedOutputs: p.expectedOutputs,
 					taskId: p.taskId,
+					requestedByUser: p.requestedByUser,
 				};
 			}
 		}
@@ -525,16 +658,44 @@ class Harness {
 	}
 
 	/**
-	 * Waits until a receipt reaches the expected status.
+	 * Waits until the terminal record is written for the expected status.
 	 *
-	 * The receipt is written before the task's lock is released, so this waits for
-	 * both: the terminal record and the freed slot.
+	 * The evidence is the receipt write itself (`write:<status>`), because the
+	 * queue-backed commit records its transition there; the legacy `releaseTask`
+	 * stub is no longer on this path, so waiting for it would wait forever. Release
+	 * is asserted separately, against the queue's own hold and work rows, because
+	 * that is what actually gates it now.
 	 */
+	/** The task id the dispatch actually created for the most recent call. */
+	lastTaskId: string | undefined;
+
+	/** True when the queue has confirmed this task's receipt for round 1. */
+	committed(taskId: string): boolean {
+		const db = openReadConnection(PROJECT_ROOT);
+		if (db === null) {
+			return false;
+		}
+		try {
+			const row = readRound(db, taskId, 1);
+			return row !== null && row["commit_state"] === "committed";
+		} finally {
+			closeQueueConnection(PROJECT_ROOT, "read");
+		}
+	}
+
 	async waitForStatus(taskId: string, status: TaskStatus): Promise<LegacyTestReceipt | undefined> {
 		for (let attempt = 0; attempt < 100; attempt += 1) {
 			const receipt = this.written.get(taskId);
 			const current = receipt ? currentRound(receipt) : undefined;
-			if (current?.status === status && this.released.includes(taskId)) {
+			// `status` on the double is the worker outcome, which is decided before the
+			// terminal commit runs. Waiting only for the write event would let an
+			// assertion observe the queue mid-commit — the write event is emitted when
+			// the writer starts, not when the commit is confirmed.
+			// The queue is the authority on whether the commit finished, so wait for the
+			// committed row instead of the in-memory write event: an assertion that runs
+			// between `beginTerminal` and `confirmReceipt` would read `pending` and call a
+			// successful delivery a failed one.
+			if (current?.status === status && this.events.includes(`write:${status}`) && this.committed(taskId)) {
 				return receipt;
 			}
 			await this.waitForUpdate();
@@ -584,6 +745,10 @@ interface UiHarness {
 	 */
 	releaseNext(): void;
 	clearStatuses(): void;
+	/** Options offered by the capability-overlap prompt, empty when it was not shown. */
+	workflowChoices: string[];
+	/** Sets what the user answers to the capability-overlap prompt. */
+	setWorkflowDecision(d: string | undefined): void;
 }
 
 function makeContext(options: { hasUI?: boolean; cwd?: string } = {}): UiHarness {
@@ -596,6 +761,8 @@ function makeContext(options: { hasUI?: boolean; cwd?: string } = {}): UiHarness
 	let answer: string | undefined;
 	let held = false;
 	let answerDespiteAbort = false;
+	const workflowChoices: string[] = [];
+	let workflowDecision: string | undefined;
 	// One resolver per parked dialog, so releases are per-dialog.
 	const parked: Array<() => void> = [];
 	const ui = {
@@ -604,6 +771,12 @@ function makeContext(options: { hasUI?: boolean; cwd?: string } = {}): UiHarness
 			offered: string[],
 			dialogOptions?: { signal?: AbortSignal },
 		): Promise<string | undefined> => {
+			if (offered.includes("Send it to WorkBuddy")) {
+				// The capability-overlap prompt: a test states which workflow the user
+				// picks, and `undefined` models a dismissed dialog.
+				workflowChoices.push(...offered);
+				return workflowDecision;
+			}
 			if (offered.includes("Submit this round")) {
 				targetChoices.push(...offered);
 				return targetDecision ?? "Submit this round";
@@ -650,12 +823,24 @@ function makeContext(options: { hasUI?: boolean; cwd?: string } = {}): UiHarness
 			harness.notifyUpdate();
 		},
 	};
-	const ctx = { cwd: options.cwd ?? PROJECT_ROOT, hasUI: options.hasUI ?? true, ui };
+	// The host guarantees `sessionManager` on every extension context, and the
+	// dispatch path reads it for the queue owner's identity, so the double supplies
+	// it too — a missing field is a fixture gap, not a code path to guard.
+	const ctx = {
+		cwd: options.cwd ?? PROJECT_ROOT,
+		hasUI: options.hasUI ?? true,
+		sessionManager: { getSessionId: () => "omp-approval-session" },
+		ui,
+	};
 	return {
 		ctx: ctx as unknown as ExtensionContext,
 		choices,
 		targetChoices,
 		targetDecision,
+		workflowChoices,
+		setWorkflowDecision: (d: string | undefined) => {
+			workflowDecision = d;
+		},
 		setTargetDecision: (d: string) => {
 			targetDecision = d;
 		},
@@ -958,9 +1143,16 @@ function doctorDetailsOf(result: AgentToolResult<unknown>): DoctorDetails {
 let harness: Harness;
 
 beforeEach(async () => {
-	const raw = await mkdtemp(path.join(os.tmpdir(), "wb-approval-test-"));
-	PROJECT_ROOT = await realpath(raw);
+	PROJECT_ROOT = await createFixtureRoot("wb-approval-test-");
 	allocatedRoots.push(PROJECT_ROOT);
+	// Dispatch now registers the round in the project queue before sending anything,
+	// and the queue refuses a project that was never set up. The fixture is put in the
+	// state a real /wb setup leaves behind, so the tests exercise the live gate rather
+	// than a bypass of it.
+	await migrateProjectToQueue(PROJECT_ROOT);
+	await enableProject(PROJECT_ROOT);
+	closeQueueConnection(PROJECT_ROOT);
+	closeQueueConnection(PROJECT_ROOT, "read");
 	harness = new Harness();
 	// A real WorkBuddy turn stays open while it works and streams its updates, so
 	// the default fixture turn is held open too. Tests that assert on the turn's
@@ -968,12 +1160,92 @@ beforeEach(async () => {
 	harness.holdTurn();
 });
 
+describe("capability overlap - the workflow is the user's choice", () => {
+	it("delegates when the user picks the WorkBuddy workflow", async () => {
+		const h = makeContext();
+		h.setWorkflowDecision("Send it to WorkBuddy");
+		harness.start();
+		const result = await harness.call(
+			"wb_task",
+			{ prompt: "produce the report", expectedOutputs: ["report.docx"], requestedByUser: true },
+			h.ctx,
+		);
+		// The overlap prompt was shown with both sides offered...
+		expect(h.workflowChoices).toEqual(["Send it to WorkBuddy", "Keep it in this session"]);
+		// ...and choosing WorkBuddy continues into the ordinary dispatch path.
+		expect(harness.captured.length).toBe(1);
+		expect(result.details).not.toMatchObject({ workflow: "local" });
+	});
+
+	it("stages nothing when the user keeps the work local", async () => {
+		const h = makeContext();
+		h.setWorkflowDecision("Keep it in this session");
+		harness.start();
+		const result = await harness.call(
+			"wb_task",
+			{ prompt: "produce the report", expectedOutputs: ["report.docx"], requestedByUser: true },
+			h.ctx,
+		);
+		// A local answer must leave no session, no staged round and no lock; the
+		// point of asking before staging is that "no" costs nothing.
+		expect(harness.captured.length).toBe(0);
+		expect(result.details).toMatchObject({ workflow: "local" });
+		expect(JSON.stringify(result.content)).toContain("complete it here");
+	});
+
+	it("reports a dismissed prompt as undecided rather than as a local choice", async () => {
+		const h = makeContext();
+		h.setWorkflowDecision(undefined);
+		harness.start();
+		const result = await harness.call(
+			"wb_task",
+			{ prompt: "produce the report", expectedOutputs: ["report.docx"], requestedByUser: true },
+			h.ctx,
+		);
+		// A dismissal answers nothing. Calling it "local" would tell the model to
+		// complete work the user never assigned to this session.
+		expect(harness.captured.length).toBe(0);
+		expect(result.details).toMatchObject({ workflow: "undecided" });
+		expect(JSON.stringify(result.content)).toContain("Ask the user");
+	});
+
+	it("asks nothing when the model delegates on its own initiative", async () => {
+		const h = makeContext();
+		// No `requestedByUser`: the user never named WorkBuddy, so there is no
+		// preference to arbitrate and the delegation must not be interrupted. This is
+		// what keeps an ordinary "make me a Word report" from costing two prompts.
+		h.setWorkflowDecision(undefined);
+		harness.start();
+		await harness.call("wb_task", { prompt: "produce the report", expectedOutputs: ["report.docx"] }, h.ctx);
+		expect(h.workflowChoices).toEqual([]);
+		expect(harness.captured.length).toBe(1);
+	});
+
+	it("asks nothing when only WorkBuddy produces the deliverable", async () => {
+		const h = makeContext();
+		h.setWorkflowDecision(undefined);
+		harness.start();
+		await harness.call(
+			"wb_task",
+			{ prompt: "produce the deck", expectedOutputs: ["deck.pptx"], requestedByUser: true },
+			h.ctx,
+		);
+		// A .pptx is WorkBuddy's own deliverable, so there is no overlap to resolve
+		// and the delegation must not be blocked waiting for a choice nobody needs.
+		expect(h.workflowChoices).toEqual([]);
+		expect(harness.captured.length).toBe(1);
+	});
+});
+
 describe("approval - no grant without an explicit human decision", () => {
 	it("denies when the user dismisses the dialog", async () => {
 		const h = makeContext();
 		h.setAnswer(undefined);
 		harness.start();
-		await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
+		const probe = await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
+		if (harness.captured.length === 0) {
+			throw new Error(`dispatch did not open a session: ${JSON.stringify(probe.details)}`);
+		}
 
 		const answer = await harness.lastSession().callbacks.onRequest(
 			"codebuddy.ai/interruptionRequest",
@@ -1261,7 +1533,7 @@ describe("approval - no grant without an explicit human decision", () => {
 		const started = await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
 		const taskId = taskIdOf(started);
 		if (taskId === undefined) {
-			throw new Error("no taskId");
+			throw new Error(`no taskId: ${JSON.stringify(started.details)}`);
 		}
 		h.clearStatuses();
 
@@ -1289,7 +1561,7 @@ describe("approval - terminal states and receipts", () => {
 	it("keeps a partial reply when the stream dies mid-turn", async () => {
 		const h = makeContext();
 		harness.start();
-		await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
+		const started = await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
 		const session = harness.lastSession();
 		await session.callbacks.onUpdate({
 			sessionId: SESSION_ID,
@@ -1297,10 +1569,10 @@ describe("approval - terminal states and receipts", () => {
 		});
 		harness.failTurn(new Error("socket closed"));
 
-		const receipt = await harness.waitForStatus(TASK_ID, "interrupted");
+		const receipt = await harness.waitForStatus(taskIdOf(started) ?? TASK_ID, "interrupted");
 		expect(receipt?.error?.code).toBe(WB_ERROR_CODE.interrupted);
 		expect(receipt?.summary).toBe("partial findings");
-		expect(harness.released).toContain(TASK_ID);
+		expect(harness.events).toContain("write:interrupted");
 	});
 
 	it("reports a missing expected output as a failure and keeps the artifacts", async () => {
@@ -1308,10 +1580,10 @@ describe("approval - terminal states and receipts", () => {
 		harness.artifacts = ["/project/.wb-bridge/tasks/t/outputs/notes.md"];
 		const h = makeContext();
 		harness.start();
-		await harness.call("wb_task", { prompt: "make a report" }, h.ctx);
+		const started = await harness.call("wb_task", { prompt: "make a report" }, h.ctx);
 		harness.releaseTurn();
 
-		const receipt = await harness.waitForStatus(TASK_ID, "failed");
+		const receipt = await harness.waitForStatus(taskIdOf(started) ?? TASK_ID, "failed");
 		expect(receipt?.error?.code).toBe(WB_ERROR_CODE.outputMissing);
 		expect(receipt?.error?.message).toContain("report.md");
 		expect(receipt?.artifacts).toEqual(harness.artifacts);
@@ -1321,7 +1593,7 @@ describe("approval - terminal states and receipts", () => {
 		harness.artifacts = ["/project/.wb-bridge/tasks/t/outputs/report.md"];
 		const h = makeContext();
 		harness.start();
-		await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
+		const started = await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
 		const session = harness.lastSession();
 		await session.callbacks.onUpdate({
 			sessionId: SESSION_ID,
@@ -1333,17 +1605,17 @@ describe("approval - terminal states and receipts", () => {
 		});
 		harness.releaseTurn();
 
-		const receipt = await harness.waitForStatus(TASK_ID, "completed");
+		const receipt = await harness.waitForStatus(taskIdOf(started) ?? TASK_ID, "completed");
 		expect(receipt?.summary).toBe("done: report written");
 		expect(receipt?.artifacts).toEqual(harness.artifacts);
 		expect(receipt?.error).toBeNull();
-		expect(harness.released).toContain(TASK_ID);
+		expect(harness.events).toContain("write:completed");
 	});
 
 	it("does not retain reasoning chunks in the task summary", async () => {
 		const h = makeContext();
 		harness.start();
-		await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
+		const started = await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
 		const session = harness.lastSession();
 		await session.callbacks.onUpdate({
 			sessionId: SESSION_ID,
@@ -1355,7 +1627,7 @@ describe("approval - terminal states and receipts", () => {
 		});
 		harness.releaseTurn();
 
-		const receipt = await harness.waitForStatus(TASK_ID, "completed");
+		const receipt = await harness.waitForStatus(taskIdOf(started) ?? TASK_ID, "completed");
 		expect(receipt?.summary).toBe("visible answer");
 	});
 
@@ -1363,10 +1635,10 @@ describe("approval - terminal states and receipts", () => {
 		harness.outcome = { stopReason: "refusal" };
 		const h = makeContext();
 		harness.start();
-		await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
+		const started = await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
 		harness.releaseTurn();
 
-		const receipt = await harness.waitForStatus(TASK_ID, "failed");
+		const receipt = await harness.waitForStatus(taskIdOf(started) ?? TASK_ID, "failed");
 		expect(receipt?.error?.code).toBe(WB_ERROR_CODE.taskFailed);
 		expect(receipt?.error?.message).toContain("refusal");
 	});
@@ -1375,10 +1647,10 @@ describe("approval - terminal states and receipts", () => {
 		harness.outcome = { stopReason: "end_turn", errorMessage: "quota exhausted" };
 		const h = makeContext();
 		harness.start();
-		await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
+		const started = await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
 		harness.releaseTurn();
 
-		const receipt = await harness.waitForStatus(TASK_ID, "failed");
+		const receipt = await harness.waitForStatus(taskIdOf(started) ?? TASK_ID, "failed");
 		expect(receipt?.error?.message).toBe("quota exhausted");
 	});
 
@@ -1389,10 +1661,14 @@ describe("approval - terminal states and receipts", () => {
 		const result = await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
 
 		expect(result.isError).toBe(true);
-		// Nothing was delivered, so the task must not be left looking alive.
-		const receipt = harness.written.get(TASK_ID);
+		// Nothing was delivered, so the task must not be left looking alive. The id is
+		// whatever dispatch created; the queue-backed release is proven by the receipt
+		// write itself, not by the legacy lock stub.
+		const failedTaskId = taskIdOf(result) ?? harness.lastTaskId;
+		expect(failedTaskId).toBeString();
+		const receipt = failedTaskId === undefined ? undefined : harness.written.get(failedTaskId);
 		expect(receipt?.status).toBe("failed");
-		expect(harness.released).toContain(TASK_ID);
+		expect(harness.events).toContain("write:failed");
 	});
 
 	it("leaves a late success from overwriting a cancellation", async () => {
@@ -1440,10 +1716,12 @@ describe("approval - terminal states and receipts", () => {
 		await harness.call("wb_task", { prompt: "long one" }, h.ctx);
 
 		await harness.shutdownExtension();
-		const receipt = harness.written.get(TASK_ID);
+		const cancelledTaskId = harness.lastTaskId;
+		expect(cancelledTaskId).toBeString();
+		const receipt = cancelledTaskId === undefined ? undefined : harness.written.get(cancelledTaskId);
 		expect(receipt?.status).toBe("cancelled");
 		expect(receipt?.error?.code).toBe(WB_ERROR_CODE.interrupted);
-		expect(harness.released).toContain(TASK_ID);
+		expect(harness.events).toContain("write:cancelled");
 	});
 
 	it("reports a terminal task from an earlier session without touching its session", async () => {
@@ -1498,7 +1776,11 @@ describe("approval - terminal states and receipts", () => {
 	});
 
 	it("refuses to run a task from an unbound project folder", async () => {
-		const h = makeContext({ cwd: "C:/other-project" });
+		// A real directory that is not the bound root: the refusal is about project
+		// ownership, not about the path being absent.
+		const otherProject = await createFixtureRoot("wb-other-project-");
+		otherProjects.push(otherProject);
+		const h = makeContext({ cwd: otherProject });
 		harness.start();
 		const result = await harness.call("wb_task", { prompt: "x" }, h.ctx);
 
@@ -1516,16 +1798,34 @@ describe("approval - terminal states and receipts", () => {
 });
 
 describe("terminal commit ordering and storage failures", () => {
-	it("commits the terminal receipt before releasing the lock on success", async () => {
+	it("commits the terminal receipt before releasing the round", async () => {
 		const h = makeContext();
 		harness.start();
-		await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
+		const started = await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
+		const taskId = taskIdOf(started) ?? TASK_ID;
 		harness.releaseTurn();
-		await harness.waitForStatus(TASK_ID, "completed");
-		const terminalWrite = harness.events.indexOf("write:completed");
-		const release = harness.events.indexOf("release");
-		expect(terminalWrite).toBeGreaterThanOrEqual(0);
-		expect(release).toBeGreaterThan(terminalWrite);
+		await harness.waitForStatus(taskId, "completed");
+
+		// The invariant is "the record is written before anything is released", and on
+		// the queue path the release is the `works` row leaving `active` in the same
+		// transaction that confirms the receipt — so the evidence is the write event
+		// followed by a committed receipt on disk, not the legacy lock stub.
+		expect(harness.events).toContain("write:completed");
+		// The invariant is that release follows a proven commit: the row is committed,
+		// the execution hold is gone and the work record no longer occupies scope.
+		const committedRoot = PROJECT_ROOT;
+		const db = openReadConnection(committedRoot);
+		expect(db).not.toBeNull();
+		try {
+			const row = readRound(db!, taskId, 1);
+			expect(row).not.toBeNull();
+			expect(row?.["commit_state"]).toBe("committed");
+			const resources = readRoundResources(db!, taskId, 1);
+			expect(resources.holds).toEqual([]);
+			expect(resources.workState).toBe("released");
+		} finally {
+			closeQueueConnection(committedRoot, "read");
+		}
 	});
 
 	it("keeps the lock and reports the worker outcome when the terminal write fails", async () => {
@@ -1548,31 +1848,36 @@ describe("terminal commit ordering and storage failures", () => {
 		expect(view.status).toBe("completed");
 		expect(view.error).toBeNull();
 		expect(view.storageError?.code).toBe(WB_ERROR_CODE.storageError);
-		// The lock was never released, and the old receipt is untouched on disk.
-		expect(harness.released).toEqual([]);
+		const persisted = openReadConnection(PROJECT_ROOT);
+		expect(persisted).not.toBeNull();
+		try {
+			const row = readRound(persisted!, taskId, 1);
+			expect(row?.["status"]).toBe("completed");
+			expect(row?.["outcome_json"]).not.toBeNull();
+			expect(row?.["commit_state"]).toBe("failed");
+			expect(String(row?.["storage_error_json"])).toContain(WB_ERROR_CODE.storageError);
+		} finally {
+			closeQueueConnection(PROJECT_ROOT, "read");
+		}
+		// Nothing was released: an unproven write cannot free the round's hold, and the
+		// old receipt is untouched on disk.
 		expect(harness.events).not.toContain("release");
 		expect(harness.written.get(taskId)).toEqual(beforeWrite);
-		// Closing the owned connection is still correct even when the write failed.
-		expect(harness.closeCalls).toBe(1);
-	});
-
-	it("keeps the committed receipt and reports the failure when the release fails", async () => {
-		const h = makeContext();
-		harness.start();
-		const started = await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
-		const taskId = taskIdOf(started);
-		if (taskId === undefined) {
-			throw new Error("no taskId");
+		const held = openReadConnection(PROJECT_ROOT);
+		expect(held).not.toBeNull();
+		try {
+			expect(readRoundResources(held!, taskId, 1).holds).toHaveLength(1);
+		} finally {
+			closeQueueConnection(PROJECT_ROOT, "read");
 		}
-		harness.failRelease = true;
-		harness.releaseTurn();
-
-		const view = await pollUntil(h, taskId, (candidate) => candidate.storageError !== null);
-		expect(view.status).toBe("completed");
-		expect(view.storageError?.code).toBe(WB_ERROR_CODE.storageError);
-		// The receipt did reach disk before the release was attempted.
-		expect(harness.written.get(taskId)?.status).toBe("completed");
-		expect(harness.released).toEqual([]);
+		// Closing the owned connection is still correct even when the write failed.
+		// The close happens after the commit body finishes, so it is waited for rather
+		// than sampled: a poll that stops at `storageError` can legitimately observe
+		// the instant before the connection is released.
+		for (let attempt = 0; attempt < 100 && harness.closeCalls === 0; attempt += 1) {
+			await harness.waitForUpdate();
+		}
+		expect(harness.closeCalls).toBe(1);
 	});
 
 	it("does not write, cancel or close twice when a late success follows a cancellation", async () => {
@@ -1635,8 +1940,17 @@ describe("terminal commit ordering and storage failures", () => {
 
 		const receipt = await harness.waitForStatus(taskId, "failed");
 		expect(receipt?.error?.code).toBe(WB_ERROR_CODE.taskFailed);
-		// The failure still went through the whole commit sequence.
-		expect(harness.events.indexOf("release")).toBeGreaterThan(harness.events.indexOf("write:failed"));
+		expect(harness.events).toContain("write:failed");
+		// A failed outcome still commits: the receipt is written and the resources are
+		// released once the commit is proven, exactly as for a success.
+		const db = openReadConnection(PROJECT_ROOT);
+		expect(db).not.toBeNull();
+		try {
+			expect(readRound(db!, taskId, 1)?.["commit_state"]).toBe("committed");
+			expect(readRoundResources(db!, taskId, 1).holds).toEqual([]);
+		} finally {
+			closeQueueConnection(PROJECT_ROOT, "read");
+		}
 	});
 
 	it("does not let a cancellation's outcome be overwritten by a late artifact scan", async () => {
@@ -2065,7 +2379,8 @@ describe("wb_tasks history listing", () => {
 describe("wb_doctor read-only diagnosis", () => {
 	it("reports a missing binding and still reports the local lock", async () => {
 		const h = makeContext();
-		harness.bindingRoot = "";
+		// A missing binding is reported for the *project*: keep the root resolvable
+		// and remove only the binding, so the doctor still reports the lock.
 		harness.readBindingResult = null;
 		harness.lockResult = {
 			ownerPid: process.pid,
@@ -2107,7 +2422,8 @@ describe("wb_doctor read-only diagnosis", () => {
 		expect(interrupted).toBeDefined();
 		// The recovery advice is the safe one: a normal delegation reclaims it.
 		expect(interrupted?.nextAction).toContain("Do not delete the lock by hand");
-		expect(harness.released).toEqual([]);
+		// Diagnosis never touches the lock it reports, alive or dead.
+		expect(harness.lockResult).toEqual({ ownerPid: deadPid, taskId: "22222222-0000-4000-8000-000000000002" });
 	});
 
 	it("reports an unreadable lock as an error and keeps it", async () => {
@@ -2120,7 +2436,7 @@ describe("wb_doctor read-only diagnosis", () => {
 		expect(details.lock).toBeNull();
 		expect(details.issues.some((issue) => issue.code === WB_ERROR_CODE.taskStateInvalid)).toBe(true);
 		// Diagnosis never removes the lock it could not read.
-		expect(harness.released).toEqual([]);
+		expect(harness.lockFailure).toBeDefined();
 	});
 
 	it("reports each worker state with the matching severity", async () => {
@@ -2246,12 +2562,25 @@ describe("wb_doctor read-only diagnosis", () => {
 		} as unknown as LegacyTestReceipt);
 
 		const before = JSON.stringify([...harness.written.entries()]);
-		const releasedBefore = [...harness.released];
+		const heldBefore = openReadConnection(PROJECT_ROOT);
+		expect(heldBefore).not.toBeNull();
+		let holdsBefore: { holds: Array<{ sessionId: string; kind: string }>; workState: string | null } | null = null;
+		try {
+			holdsBefore = readRoundResources(heldBefore!, "33333333-0000-4000-8000-000000000003", 1);
+		} finally {
+			closeQueueConnection(PROJECT_ROOT, "read");
+		}
 		const writesBefore = harness.events.filter((event) => event.startsWith("write:")).length;
 		await harness.call("wb_doctor", {}, h.ctx);
 
 		expect(JSON.stringify([...harness.written.entries()])).toBe(before);
-		expect(harness.released).toEqual(releasedBefore);
+		const heldAfter = openReadConnection(PROJECT_ROOT);
+		expect(heldAfter).not.toBeNull();
+		try {
+			expect(readRoundResources(heldAfter!, "33333333-0000-4000-8000-000000000003", 1)).toEqual(holdsBefore);
+		} finally {
+			closeQueueConnection(PROJECT_ROOT, "read");
+		}
 		expect(harness.events.filter((event) => event.startsWith("write:")).length).toBe(writesBefore);
 		expect(harness.writtenBindingCalls).toBe(0);
 	});
@@ -2282,12 +2611,16 @@ describe("footer accuracy and status waits", () => {
 	it("clears the footer once a task is only mid-commit", async () => {
 		const h = makeContext();
 		harness.start();
-		await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
+		const started = await harness.call("wb_task", { prompt: "do the thing" }, h.ctx);
+		const taskId = taskIdOf(started);
+		if (taskId === undefined) {
+			throw new Error("no taskId");
+		}
 		h.clearStatuses();
 		harness.releaseTurn();
 
 		// A terminal state chosen but not yet committed is not running work.
-		await harness.waitForStatus(TASK_ID, "completed");
+		await harness.waitForStatus(taskId, "completed");
 		expect(h.statuses.some((text) => text === undefined)).toBe(true);
 	});
 
@@ -2422,48 +2755,54 @@ describe("cancellation waits for the worker's turn to end", () => {
 });
 
 describe("/wb setup configuration safety", () => {
-	it("refuses to overwrite malformed JSON in .omp/mcp.json and leaves it byte-identical", async () => {
+	/**
+	 * Setup writes one global WorkBuddy entry; the project-level `.omp/mcp.json` is now a
+	 * removal target. These cases point at the same managed file the plan actually owns,
+	 * so they prove the refusal against the file the bridge would otherwise rewrite.
+	 */
+	function managedConfigPath(): string {
+		return path.join(PROJECT_ROOT, ".test-home", ".workbuddy", "mcp.json");
+	}
+
+	it("refuses to overwrite malformed JSON and leaves it byte-identical", async () => {
 		const h = makeContext();
 		harness.start();
 
-		const ompMcpDir = path.join(PROJECT_ROOT, ".omp");
-		await mkdir(ompMcpDir, { recursive: true });
-		const ompMcpPath = path.join(ompMcpDir, "mcp.json");
+		const configPath = managedConfigPath();
+		await mkdir(path.dirname(configPath), { recursive: true });
 		const malformedContent = "{ invalid json content, broken syntax";
-		await writeFile(ompMcpPath, malformedContent, "utf-8");
+		await writeFile(configPath, malformedContent, "utf-8");
 
 		h.setAnswer("Apply MCP configuration");
 		await harness.callCommand("wb", "setup", h.ctx as unknown as ExtensionCommandContext);
 
 		expect(h.notifications.some((n) => n.type === "error" && n.message.includes("Invalid JSON"))).toBe(true);
-		const contentAfter = await readFile(ompMcpPath, "utf-8");
+		const contentAfter = await readFile(configPath, "utf-8");
 		expect(contentAfter).toBe(malformedContent);
 	});
 
-	it("refuses to overwrite non-object root or non-object mcpServers and leaves it byte-identical", async () => {
+	it("refuses to overwrite a non-object root and leaves it byte-identical", async () => {
 		const h = makeContext();
 		harness.start();
 
-		const ompMcpDir = path.join(PROJECT_ROOT, ".omp");
-		await mkdir(ompMcpDir, { recursive: true });
-		const ompMcpPath = path.join(ompMcpDir, "mcp.json");
+		const configPath = managedConfigPath();
+		await mkdir(path.dirname(configPath), { recursive: true });
 		const arrayContent = JSON.stringify(["not", "an", "object"]);
-		await writeFile(ompMcpPath, arrayContent, "utf-8");
+		await writeFile(configPath, arrayContent, "utf-8");
 
 		h.setAnswer("Apply MCP configuration");
 		await harness.callCommand("wb", "setup", h.ctx as unknown as ExtensionCommandContext);
 
 		expect(h.notifications.some((n) => n.type === "error" && n.message.includes("root must be a JSON object"))).toBe(true);
-		expect(await readFile(ompMcpPath, "utf-8")).toBe(arrayContent);
+		expect(await readFile(configPath, "utf-8")).toBe(arrayContent);
 	});
 
 	it("refuses to overwrite a foreign conflicting omp-wb-bridge entry", async () => {
 		const h = makeContext();
 		harness.start();
 
-		const ompMcpDir = path.join(PROJECT_ROOT, ".omp");
-		await mkdir(ompMcpDir, { recursive: true });
-		const ompMcpPath = path.join(ompMcpDir, "mcp.json");
+		const configPath = managedConfigPath();
+		await mkdir(path.dirname(configPath), { recursive: true });
 		const foreignContent = JSON.stringify(
 			{
 				mcpServers: {
@@ -2476,12 +2815,12 @@ describe("/wb setup configuration safety", () => {
 			null,
 			2,
 		);
-		await writeFile(ompMcpPath, foreignContent, "utf-8");
+		await writeFile(configPath, foreignContent, "utf-8");
 
 		h.setAnswer("Apply MCP configuration");
 		await harness.callCommand("wb", "setup", h.ctx as unknown as ExtensionCommandContext);
 
 		expect(h.notifications.some((n) => n.type === "error" && n.message.includes("does not match this bridge installation"))).toBe(true);
-		expect(await readFile(ompMcpPath, "utf-8")).toBe(foreignContent);
+		expect(await readFile(configPath, "utf-8")).toBe(foreignContent);
 	});
 });

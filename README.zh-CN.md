@@ -2,167 +2,166 @@
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-`omp-wb-bridge` 是一个连接 OMP 和 WorkBuddy 桌面端会话的原生扩展。
+`omp-wb-bridge` 是一个 OMP 扩展，用来把同一项目中的专业任务交给 WorkBuddy。工程编码、重构和命令行构建留在 OMP；Word 报告、PPT、表格分析、海报等工作可以交给 WorkBuddy。OMP 准备目标和材料，跟进执行，并检查交付成果。具体能力取决于 WorkBuddy 的账号、插件和连接器配置。
 
-分工很简单：工程编码、代码重构、命令行工具留在 OMP 里做；写 Word 报告、做 PPT 幻灯片、复杂数据分析、生成海报视频这些偏办公和设计的事，交由 WorkBuddy 桌面端跑。在 WorkBuddy 里直接发起的工作，也可以同步回 OMP 并在终端里直接验收和集成。
+使用前需要在 WorkBuddy 桌面准备好项目会话，必要时打开会话或发送一条消息，让桌面端提供可用的 ACP 入口。桥接只连接这些既有会话。
 
-两端共用一套本地文件存储和三个基于 stdio 的 MCP 工具。没有后台常驻守护进程，不额外加一层任务规划器，也不搞私有记忆系统。
+## 原理
 
----
+```mermaid
+flowchart LR
+    A[确认目标与材料] --> B[桥接核验并交接]
+    B --> C[WorkBuddy 执行]
+    C --> D[OMP 检查交付物]
+    D -->|接受| E[交付]
+    D -->|需修正，至多一次| B
+```
 
-## 提供的命令与工具
+两端共用本地项目目录，通过 ACP 交接任务与进度。桥接保存输入快照、任务与会话的关联、执行结果和收据；文件交付物放在 `.wb-bridge/tasks/<taskId>/rounds/<n>/outputs/`。
 
-### 1. 终端管理命令 (`/wb`)
+WorkBuddy 保留自己的模型、插件、连接器和原生运行环境。共享的 `project_context` MCP 工具只读项目状态，不参与派发或修改队列。
+
+## 核心功能
+
+- 每个新任务使用独立、未被其他委派用过的会话；补充与修正回原会话，重启后仍保留关联。
+- 不同会话、文件范围兼容的任务可并行。没有合适会话时排队，并说明等待原因。
+- 默认跟进到结果提交和成果检查；用户也可明确选择后台执行，稍后接收结果。
+- 按验收条件检查当前成果，用文件哈希关联评审版本。每个任务至多自动修正一次，文件变化后需重新验收。
+- 任务提交与原生步骤权限分别确认，模型不能自行批准。关闭权限弹窗、超时或无法解析时拒绝放行。
+- 桥接不持久化连接凭据、环境秘密、完整对话或模型推理。
+- 失败时保留部分成果和已知结果。可能已发送的工作不自动重发；修复收据与解除执行隔离是两项独立操作。
+
+## 安装指南
+
+### 前置条件
+
+- Bun 1.4+
+- OMP 18.10.3+
+- 本机装有 WorkBuddy 桌面端，并且它能暴露本地 ACP 端点
+- 用户在 WorkBuddy 桌面为该项目准备好原生会话，桌面正在服务它们
+
+### 安装到用户目录
+
+在终端运行以下命令，先查看安装位置和配置改动：
+
+```bash
+git clone https://github.com/gongquan45/omp-workbuddy-bridge.git
+cd omp-workbuddy-bridge
+bun install
+
+bun src/install.ts --preview
+```
+
+确认预览内容后再应用：
+
+```bash
+bun src/install.ts --apply
+```
+
+安装器会创建或复用稳定发行目录、安装依赖、注册 OMP 插件，并配置 `~/.workbuddy/mcp.json` 中的桥接条目。配置冲突时不会覆盖原文件；请查看报告中的注册与配置结果，不要把部分成功当成安装完成。
+
+安装器不会自动重启程序。重启 OMP，并在目标项目中打开新会话后，确认实际加载的插件路径。需要自定义目录时，可用 `bun src/install.ts --help` 查看参数。
+
+### 开发或临时加载
+
+开发时可以直接加载本地源码包：
+
+```bash
+cd /path/to/omp-wb-bridge
+bun install
+
+omp --cwd /path/to/your/project -e /path/to/omp-wb-bridge
+```
+
+`-e` 后使用包目录的绝对路径，不要只指向 `src/index.ts`，否则配套 Skill 无法被完整发现。需要持久加载源码时，可将包目录追加到 OMP 现有的 `extensions` 列表，保留其他条目并重启 OMP。已安装发行目录时，不要再加载一份源码入口。
+
+## 给 Agent 的安装步骤
+
+可将下面的要求交给 Agent：
+
+```text
+请安装并启用 omp-wb-bridge：
+
+1. 核对 Bun 1.4+、OMP 18.10.3+ 和 WorkBuddy 桌面端是否可用。
+   缺少前置条件就报告，不擅自安装或升级这些程序。
+2. 在源码仓库目录运行 bun install，然后运行 bun src/install.ts --preview。
+   展示发行目录、配置文件和拟写入内容，取得用户明确同意后再运行 --apply。
+3. 检查安装报告，请用户重启 OMP，并核对实际加载的发行目录。
+   不要再通过 -e 或 extensions 重复加载另一份源码入口。
+4. 请用户在 WorkBuddy 桌面打开目标项目并准备原生会话，必要时手工激活。
+   在该项目的 OMP 会话中运行 /wb setup；尚未绑定时再运行 /wb bind。
+   涉及配置和绑定的确认由用户完成，不替用户选择批准。
+5. 用 /wb status 和 /wb doctor 核对会话池、路径和阻塞原因。
+   /wb doctor 只做 HTTP 探测，不做 ACP 握手；诊断成功不代表任务已执行。
+   不默认发测试任务，不运行 live-smoke，也不自行批准原生权限。
+```
+
+## 如何使用
+
+1. 在 WorkBuddy 桌面把项目目录作为工作区打开，为要交出去的工作开一个原生会话，确认桌面正在服务它。要并行几个任务就准备几个会话。
+2. 在 OMP 里执行 `/wb setup`。它先预览要写什么，人确认后才写 `~/.workbuddy/mcp.json` 的 `omp-wb-bridge` 条目，并初始化项目状态；项目还没绑定时，它会问要不要顺便纳入桌面上找到的会话。
+3. 还没绑定就执行 `/wb bind`，把项目绑到一个已核验的会话名册上。之后新开的同项目会话自动进名册，不用重绑。
+4. 用自然语言说要什么，比如“用 WorkBuddy 做一份销售数据的季度分析，输出 xlsx”，或者“让 WorkBuddy 出一版海报”。
+5. OMP 派出任务、跟进执行，然后打开真实文件检查，验收通过才把成果交给你。
+
+对 `.docx`、`.pdf`、`.md`、`.csv`、`.xlsx` 等双方都能处理的格式，按提示选择交给 WorkBuddy 还是留在 OMP。选择执行方不等于批准任务或原生步骤权限。
+
+会话忙碌或离线时，先查看等待原因；上下文都已分配给其他任务时，需要在桌面另开同项目会话。项目绑定会保留，新会话会自动纳入。执行状态未知时不要重复提交，也不要通过清理状态或切换会话绕过隔离。
+
+ACP 端点按需开启，worker 轮换或桌面重启后可能被回收，项目绑定则会保留。出现 `WB_SESSION_NOT_RUNNING` 时，先在桌面打开或激活原会话，再核对入口状态；不要仅因这个错误重新绑定或重复发任务。
+
+## 命令与工具
+
+### `/wb` 命令
 
 | 命令 | 用途 |
 |---|---|
-| `/wb bind` | 选择并绑定当前项目到 WorkBuddy 桌面端的专用会话。 |
-| `/wb status` | 查看绑定会话状态、桌面端进程健康度以及当前正在运行的任务。 |
-| `/wb send <requestId>` | 确认并发送暂存的目标草稿（供没有图形界面的终端使用）。 |
-| `/wb release <workId>` | 显式解除意外残留或阻断的文件范围锁。 |
-| `/wb setup` | 一键配置 OMP（`.omp/mcp.json`）与 WorkBuddy（`~/.workbuddy/mcp.json`）的 MCP 连接，并同步协作技能。 |
+| `/wb` | 打开工作台；没有界面时打印同样的信息。 |
+| `/wb status` | 只读：项目会话池、桌面端健康度、本进程正在跑的任务。 |
+| `/wb setup` | 预览并写入唯一的全局 WorkBuddy MCP 条目，同时启用项目状态。文件里有外来或损坏的同名条目就整个拒绝。 |
+| `/wb init` | 迁移并启用项目状态，不动配置。 |
+| `/wb bind` | 确认并保存项目绑定，纳入该项目通过核验的 WB 会话。 |
+| `/wb send <requestId>` | 确认并提交无界面会话下 `wb_task` 报告过的冻结草稿。 |
+| `/wb tasks [task]` | 列出本项目任务，或看单个任务详情。 |
+| `/wb background <task>` | 人明确选择后，把某个任务的当前轮次改成后台回报。 |
+| `/wb results [task]` | 查看本 OMP 会话还没消费的结果和当前文件状态。 |
+| `/wb repair [task]` | 依据队列已记录的结果重建失败收据。不重发，也不证明 WorkBuddy 那轮已经结束。 |
+| `/wb cancel [task]` | 取消本 OMP 进程拥有的任务。别的进程或别人的任务不动。 |
+| `/wb release [task]` | 人写下结束依据并再次确认后，释放一个隔离中的执行现场。 |
+| `/wb doctor` | 只读诊断绑定、队列、存储和桌面端健康度。 |
+| `/wb usage` | 打印命令参考。 |
 
-### 2. OMP 工具箱
+### OMP 宿主工具
 
 | 工具 | 用途 |
 |---|---|
-| `wb_task` | 发起任务委派。需要明确传入意图（`objective`）和验收指标（`acceptance`）。提交前会弹窗让用户选择确认；若涉及发邮件、部署等外部副作用，会单独要求二次确认。 |
-| `wb_status` | 轮询任务状态、当前轮次回合回复和产物文件列表（包含文件类型、实际大小及 SHA-256 哈希）。 |
-| `wb_cancel` | 取消由当前进程发起的任务。会先等桌面端收尾确认后再切断连接，避免下次调用排队卡死。 |
-| `wb_tasks` | 分页查看历史委派任务列表，按修改时间倒序排列。只读操作。 |
-| `wb_doctor` | 检查绑定配置、本地锁和桌面端健康接口，不修改任何文件。 |
+| `wb_task` | 提交一轮委派，含目标和可核验的验收条件。派发前要人确认；有外部副作用时另做一次风险点确认。 |
+| `wb_status` | 读任务状态和已核验成果，等的是持久提交，不是桌面端的口头承诺。 |
+| `wb_review` | 记录评审者自己对每条验收标准的结论，绑定当前文件哈希。`changes_requested` 会启动该任务唯一一次自动修正。 |
+| `wb_cancel` | 取消本进程拥有的活动任务。 |
+| `wb_tasks` | 分页列出已持久化的轮次，严格只读。 |
+| `wb_doctor` | 只读检查绑定、队列占用和桌面端健康度。 |
 
-### 3. 双端共享 MCP 工具 (`src/mcp.ts`)
+### 只读 MCP 工具
 
-启动方式为普通 stdio 进程（`bun src/mcp.ts --project <项目根路径> --agent <omp|workbuddy>`），提供三项工具：
+`project_context`（`src/mcp.ts`）只读队列中的工作、范围占用、交付物和评审结论，不提供 MCP 写入工具。
 
-| MCP 工具 | 用途 |
-|---|---|
-| `project_context` | 查询项目内各任务的活跃状态、持有的文件路径、阶段里程碑和审查结论。 |
-| `work_claim` | 在开始干活前声明自己要读写的文件目录范围，防止两边同时改动重叠的文件。 |
-| `work_publish` | 登记关键里程碑、交付物清单，或给对方的产物写审查意见（包含实测哈希核对）。 |
+### 随包技能
 
-### 4. 配套技能 (Skills)
+- [委派 Skill](skills/workbuddy-delegate/SKILL.md)：OMP 的委派、跟进与验收流程。
+- [原生能力参考](skills/workbuddy-delegate/references/native-capabilities.md)：输入与验收示例。
+- [现场验收手册](skills/workbuddy-delegate/references/live-smoke.md)：需要单独授权，不作为日常任务执行。
 
-- **`skills/omp-wb-collaboration/SKILL.md`**：两端通用的协作约定（动手前先查范围、动文件先认领、产出算哈希、用完即释放）。
-- **`skills/workbuddy-delegate/SKILL.md`**：指导 OMP 何时该自己做、何时建议委派给 WorkBuddy，以及如何写出合格的验收条件。
-- **`skills/workbuddy-delegate/references/native-capabilities.md`**：整理了 19 种原生专业场景（写报告、改 PPT、生成图表、日常开发、定时计划等）的具体输入和最低验收底线。
-- **自动发现**：已接入 OMP 原生 `resources_discover`，无论通过包目录加载还是 `-e src/index.ts` 单文件加载，两项技能都能被 OMP 正常识别。
+## 开发
 
----
-
-## 协作与执行流程
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant User as 用户 / OMP 界面
-    participant OMP as OMP (src/index.ts)
-    participant Tasks as 任务存储 (tasks.ts)
-    participant Collab as 协作记录 (collaboration.ts)
-    participant MCP as MCP stdio (src/mcp.ts)
-    participant WB as WorkBuddy 桌面端
-
-    Note over User, OMP: 1. 意图确认与草稿冻结
-    OMP->>OMP: 校验并冻结输入文件哈希与目标
-    OMP->>User: 弹窗选择 (提交本轮 / 留在 OMP / 取消)
-    User-->>OMP: 选择 "提交本轮" (或运行 /wb send <requestId>)
-    opt 包含外部系统动作 (发邮件/部署/云写入)
-        OMP->>User: 单独弹窗核准具体动作与参数
-        User-->>OMP: 批准执行单次动作
-    end
-
-    Note over OMP, Collab: 2. 准备目录与认领范围
-    OMP->>Tasks: prepareTask (验证 binding，写 brief.md 与 v2 receipt)
-    OMP->>Collab: claimWork (登记输入只读范围和当前轮 outputs 写范围)
-    Collab-->>OMP: 确认无冲突 (若有重叠直接报错并释放锁)
-
-    Note over OMP, WB: 3. 运行并同步检查点
-    OMP->>WB: 建立 ACP 连接并直接发送完整意图文本
-    loop 执行过程中
-        WB->>MCP: work_publish (自报阶段性里程碑与成果)
-        OMP->>MCP: project_context (按需查看当前进展)
-    end
-    WB-->>OMP: end_turn (返回收工原因和文本答复)
-
-    Note over OMP, Collab: 4. 产物校验与终态提交
-    OMP->>Tasks: collectArtifacts (扫描 outputs，计算哈希与大小)
-    OMP->>Tasks: writeTask (写入包含 rounds[] 的终态 receipt.json)
-    OMP->>Collab: releaseWork (正常结束释放范围，异常则置为 blocked)
-    OMP->>Tasks: releaseTask (解开 active.lock)
-
-    Note over User, WB: 5. 独立验收与评价
-    OMP->>OMP: 用实际查看器打开文件，对照 acceptance 验收
-    OMP->>MCP: work_publish (记录绑定文件 SHA-256 的 review: accepted / changes_requested)
-```
-
----
-
-## 磁盘目录结构
-
-所有生成的运行时文件都在项目根目录下的 `.wb-bridge/` 中，不污染项目源码树：
-
-```text
-.wb-bridge/
-  binding.json                      绑定的 WorkBuddy 会话标识
-  active.lock                       项目当前的活动任务锁（一次只能跑一个委派任务）
-  collaboration.lock                协作记录短锁（仅在原子写协作元数据时极短时间持有）
-  collaboration/
-    <workId>.json                   OMP 与 WorkBuddy 登记的双端工作记录
-  tasks/<taskId>/
-    receipt.json                    v2 格式任务收据，保存完整的 rounds[] 轮次数组
-    rounds/<roundNumber>/
-      brief.md                      当前轮次交底说明
-      inputs/                       当前轮次拷入的输入文件快照
-      outputs/                      当前轮次 WorkBuddy 产出的交付文件
-  workbuddy/<workId>/
-    outputs/                        WorkBuddy 原生任务的独立产出目录
-```
-
----
-
-## 安全规则
-
-1. **提交前强制确认**：
-   - 模型工具不能给自己授权。传 `approved: true` 或在自然语言里说“用户同意了”都会被直接忽略。
-   - 目标一旦冻结，在确认期间如果输入文件被外部修改，由于 SHA-256 对不上，任务会拒绝发送并要求重新确认。
-   - 涉及发外部网络请求、云端写操作或定时计划的，必须经由独立弹窗逐项核对具体操作和参数。
-2. **权限阻断策略**：
-   - 桌面端发来的敏感权限请求，只有人主动选“允许单次”才会放行。无 UI 环境、关闭弹窗、超时或格式无法识别均直接拒绝。
-3. **文件范围互斥**：
-   - 文件锁检查按具体路径树层级进行。一个任务声明了写某个目录，另一个任务去读写该目录及其子目录都会触发 `WB_SCOPE_CONFLICT`。
-4. **真实文件与哈希绑定**：
-   - `completed` 仅代表对面正常结束且文件写下了，不等于内容合格。
-   - 验收评价必须实测文件的 SHA-256。如果文件发布后被改动过，提交评价时会直接抛出 `WB_ARTIFACT_CHANGED`。
-5. **配置文件保护 (`/wb setup`)**：
-   - 读取 `.omp/mcp.json` 或 `~/.workbuddy/mcp.json` 时，只有 `ENOENT`（文件不存在）才会新建最小配置。
-   - 遇到语法错误、JSON 根非对象、或者已被外来程序占用的同名服务项时，直接停止并报错，原文件保留逐字节不变，绝不覆盖清除。
-6. **无凭据落地**：
-   - 连接令牌、环境变量、模型内部思考过程（`agent_thought_chunk`）和完整对话历史均不存盘。
-
----
-
-## 开发与测试
-
-### 环境要求
-- **Bun 1.4+**
-- 本地安装并打开了 ACP 协议支持的 WorkBuddy 桌面端（5.8.2+）。
-
-### 测试命令
 ```bash
 bun install
 bun test
 bun run typecheck
 ```
 
-- `bun test`：执行包括任务多轮记录、锁竞争、HTTP/SSE 传输、权限拦截、MCP 双端 stdio 交互在内的全量行为测试。
-- `bun run typecheck`：通过 TypeScript 严格模式检查（0 diagnostics）。
+`bun test` 是离线行为测试，`bun run typecheck` 是 `tsc --noEmit`。项目没有构建步骤，OMP 直接加载 TypeScript 源码。
 
-### 加载方式
-```bash
-# 推荐以包目录形式加载，确保能完整发现配套 skills
-omp --cwd /path/to/your/project -e /path/to/omp-wb-bridge
+## 开源协议
 
-# 首次接入在 OMP 运行环境里配置连接
-/wb setup
-```
+本仓库尚未提供 `LICENSE` 文件，`package.json` 也未声明 `license`。使用、修改或再分发前，请先向作者确认授权条款。

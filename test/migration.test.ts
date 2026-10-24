@@ -1,40 +1,40 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
 	closeQueueConnection,
 	openProjectQueue,
+	openReadConnection,
 	openWriteConnection,
 	readMeta,
 	readProjectAccess,
 	withImmediate,
+	QUEUE_SCHEMA_VERSION,
 } from "../src/queue";
 import { legacyRequestId, migrateProjectToQueue } from "../src/migration";
 import { atomicWriteFile } from "../src/storage";
 import { delegatedWorkId, WbTaskError } from "../src/tasks";
 import { WB_ERROR_CODE, type TaskReceipt } from "../src/types";
+import { createFixtureRoot, removeFixtureRoot } from "./helpers/fixtures";
 
 let root = "";
 /** Set only once a fixture root exists; guards the cleanup below. */
 let rootReady = false;
 
 beforeEach(async () => {
-	root = await realpath(await mkdtemp(path.join(os.tmpdir(), "wb-migration-")));
+	root = await createFixtureRoot("wb-migration-");
 	rootReady = true;
 });
 
 afterEach(async () => {
-	// Guard against a setup failure leaving root unset: rm("") would
-	// resolve against the process cwd, which for bun test is this repository.
-	if (!rootReady || !path.isAbsolute(root) || root.length < 8) {
+	if (!rootReady) {
 		return;
 	}
 	rootReady = false;
 	closeQueueConnection(root);
 	closeQueueConnection(root, "read");
-	await rm(root, { recursive: true, force: true });
+	await removeFixtureRoot(root);
 });
 
 const TASK_ID = "11111111-1111-4111-8111-111111111111";
@@ -404,5 +404,180 @@ describe("works merge across receipt and collaboration sides", () => {
 		expect(record.title).toBe("old task");
 		expect(Array.isArray(record.reviews)).toBeTrue();
 		expect((record.reviews as unknown[]).length).toBe(1);
+	});
+});
+
+describe("context isolation survives the migration", () => {
+	it("records a legacy context as used and pins the task to it", async () => {
+		await writeBinding([{ sessionId: SESSION_A, role: "default", isDefault: true }]);
+		await writeReceipt([completedRound()]);
+		await migrateProjectToQueue(root);
+
+		const db = openWriteConnection(root);
+		const usage = db.query("SELECT session_id, task_id, state FROM session_usage").all() as Array<{
+			session_id: string;
+			task_id: string;
+			state: string;
+		}>;
+		// The old round really ran in that WorkBuddy context, so the context is
+		// *used* — not a clean reservation.
+		expect(usage).toHaveLength(1);
+		expect(usage[0]?.session_id).toBe(SESSION_A);
+		expect(usage[0]?.task_id).toBe(TASK_ID);
+		expect(usage[0]?.state).toBe("used");
+
+		const queue = openProjectQueue(root, { mode: "write" })!;
+		try {
+			// The task's durable affinity is the context it really used.
+			expect(queue.taskSession(TASK_ID)).toBe(SESSION_A);
+		} finally {
+			queue.close();
+		}
+	});
+
+	it("does not hand a legacy-used context to a new task", async () => {
+		await writeBinding([{ sessionId: SESSION_A, role: "default", isDefault: true }]);
+		await writeReceipt([completedRound()]);
+		await migrateProjectToQueue(root);
+
+		const queue = openProjectQueue(root, { mode: "write" })!;
+		try {
+			// The context is enrolled in the roster and looks free, but it already
+			// carries the old task's work.
+			queue.syncProjectSessions(
+				[{ sessionId: SESSION_A, workbuddyVersion: "1.2.3", availability: "idle" }],
+				Date.now(),
+			);
+			const db = openWriteConnection(root);
+			withImmediate(db, () => {
+				db.run(
+					`INSERT INTO owners(instance_id, generation, session_id, pid, state, heartbeat_at)
+					 VALUES('inst-1', 'gen-1', 'omp-1', ?, 'active', ?)`,
+					[process.pid, Date.now()],
+				);
+				db.run(
+					`INSERT INTO rounds(task_id, round, request_id, record_kind, revision, status, phase,
+						target_policy_json, desired_scope_json, owner_session, owner_generation,
+						manifest_path, manifest_sha256, approval_json, approval_consumed,
+						enqueued_at, dispatch_state, cancel_requested, commit_state,
+						review_state, delivery_mode, turns_json, updated_at)
+					 VALUES('brand-new-task', 1, 'brand-new-request', 'legacy', 1, 'queued', 'queued', ?, '{}',
+						'omp-1', 'gen-1', NULL, NULL, NULL, 0, ?, 'not_sent', 0, 'pending', 'pending', 'foreground', '[]', ?)`,
+					[JSON.stringify({ kind: "workspace_pool", role: null }), Date.now(), Date.now()],
+				);
+			});
+			const outcome = queue.claim(
+				{ sessionId: "omp-1", generation: "gen-1", processId: process.pid, instanceId: "inst-1" },
+				Date.now(),
+			);
+			expect(outcome).toMatchObject({ kind: "waiting", reason: "no_unused_session" });
+		} finally {
+			queue.close();
+		}
+	});
+});
+
+describe("schema upgrade", () => {
+	it("upgrades an older database without losing its rounds", async () => {
+		await writeBinding([{ sessionId: SESSION_A, role: "default", isDefault: true }]);
+		await writeReceipt([completedRound()]);
+		await migrateProjectToQueue(root);
+
+		const db = openWriteConnection(root);
+		// Pretend the file was written by the previous build.
+		withImmediate(db, () => {
+			db.run("UPDATE meta SET value = '2' WHERE key = 'schema_version'");
+		});
+		closeQueueConnection(root);
+
+		// The upgrade runs and keeps the data.
+		await migrateProjectToQueue(root);
+		const upgraded = openWriteConnection(root);
+		expect(readMeta(upgraded, "schema_version")).toBe(String(QUEUE_SCHEMA_VERSION));
+		const rounds = upgraded.query("SELECT task_id FROM rounds").all() as Array<{ task_id: string }>;
+		expect(rounds.map((row) => row.task_id)).toContain(TASK_ID);
+		// The new tables exist and carry the backfilled history.
+		const usage = upgraded.query("SELECT session_id, state FROM session_usage").all() as Array<{
+			session_id: string;
+			state: string;
+		}>;
+		expect(usage).toHaveLength(1);
+		expect(usage[0]?.session_id).toBe(SESSION_A);
+		expect(usage[0]?.state).toBe("used");
+	});
+
+	it("refuses a read-mode queue on an un-upgraded database", async () => {
+		await writeBinding([{ sessionId: SESSION_A, role: "default", isDefault: true }]);
+		await migrateProjectToQueue(root);
+		const db = openWriteConnection(root);
+		withImmediate(db, () => {
+			db.run("UPDATE meta SET value = '2' WHERE key = 'schema_version'");
+		});
+		closeQueueConnection(root);
+		// A reader must not mistake an older file for a current one.
+		expect(() => openProjectQueue(root, { mode: "read" })).toThrow(/run project setup to migrate it/);
+	});
+});
+
+describe("the schema upgrade preserves the project's consent and history", () => {
+	it("keeps project_enabled_at and migration_completed across a schema upgrade", async () => {
+		await writeBinding([{ sessionId: SESSION_A, role: "default", isDefault: true }]);
+		await writeReceipt([completedRound()]);
+		await migrateProjectToQueue(root);
+
+		const db = openWriteConnection(root);
+		const enabledAt = readMeta(db, "project_enabled_at");
+		const completedAt = readMeta(db, "migration_completed");
+		expect(enabledAt).not.toBeNull();
+		expect(completedAt).not.toBeNull();
+		// Pretend the file was written by the previous build.
+		withImmediate(db, () => {
+			db.run("UPDATE meta SET value = '2' WHERE key = 'schema_version'");
+		});
+		closeQueueConnection(root);
+
+		await migrateProjectToQueue(root);
+		const upgraded = openWriteConnection(root);
+		// The consent evidence and the migration marker are not rewritten by an
+		// upgrade: they say when the user authorized the project, not when the
+		// file was last touched.
+		expect(readMeta(upgraded, "project_enabled_at")).toBe(enabledAt);
+		expect(readMeta(upgraded, "migration_completed")).toBe(completedAt);
+		expect(readMeta(upgraded, "schema_version")).toBe(String(QUEUE_SCHEMA_VERSION));
+		// The project's rows are still there.
+		const rounds = upgraded.query("SELECT task_id FROM rounds").all() as Array<{ task_id: string }>;
+		expect(rounds.map((row) => row.task_id)).toContain(TASK_ID);
+	});
+
+	it("leaves a project without a binding unmigrated into an enabled state", async () => {
+		await writeReceipt([completedRound()]);
+		await migrateProjectToQueue(root);
+		const db = openWriteConnection(root);
+		expect(readMeta(db, "project_enabled_at")).toBeNull();
+		expect(readMeta(db, "migration_completed")).not.toBeNull();
+	});
+});
+
+describe("a newer schema is never migrated backwards", () => {
+	it("refuses to downgrade a database written by a newer build", async () => {
+		await writeBinding([{ sessionId: SESSION_A, role: "default", isDefault: true }]);
+		await writeReceipt([completedRound()]);
+		await migrateProjectToQueue(root);
+
+		const db = openWriteConnection(root);
+		// A file from a future build: this build must not rewrite it.
+		withImmediate(db, () => {
+			db.run("UPDATE meta SET value = '99' WHERE key = 'schema_version'");
+		});
+		closeQueueConnection(root);
+
+		await expect(migrateProjectToQueue(root)).rejects.toThrow(/newer than this build understands/);
+		// The file is left exactly as it was: no downgrade, no data loss.
+		const after = openReadConnection(root)!;
+		try {
+			expect(readMeta(after, "schema_version")).toBe("99");
+		} finally {
+			closeQueueConnection(root, "read");
+		}
 	});
 });

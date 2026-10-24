@@ -1,18 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import {
-	mkdir,
-	mkdtemp,
-	readFile,
-	readdir,
-	realpath,
-	rm,
-	stat,
-	symlink,
-	unlink,
-	utimes,
-	writeFile,
-} from "node:fs/promises";
-import os from "node:os";
+import { mkdir, readFile, readdir, stat, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import process from "node:process";
@@ -28,6 +15,7 @@ import type {
 	TaskStatus,
 } from "../src/types";
 import { WB_ERROR_CODE } from "../src/types";
+import { createFixtureRoot, removeFixtureRoot } from "./helpers/fixtures";
 import {
 	buildTaskManifestPayload,
 	collectArtifacts,
@@ -112,18 +100,18 @@ async function runPrepare(
 	);
 }
 
-/** Tracks temporary directories allocated during test runs for guaranteed cleanup. */
+/**
+ * Roots this suite created. Cleanup goes through the shared ownership helper:
+ * it refuses anything it did not register, so a wrong path fails loudly instead
+ * of deleting a directory this suite never made.
+ */
 const allocatedTempDirs: string[] = [];
 
 afterEach(async () => {
 	while (allocatedTempDirs.length > 0) {
 		const targetDir = allocatedTempDirs.pop();
 		if (targetDir !== undefined) {
-			try {
-				await rm(targetDir, { recursive: true, force: true });
-			} catch {
-				// Suppress cleanup errors to avoid masking test assertions.
-			}
+			await removeFixtureRoot(targetDir);
 		}
 	}
 });
@@ -143,8 +131,7 @@ async function pathExists(target: string): Promise<boolean> {
 }
 
 async function createProjectRoot(): Promise<string> {
-	const raw = await mkdtemp(path.join(os.tmpdir(), "wb-tasks-test-"));
-	const canonical = await realpath(raw);
+	const canonical = await createFixtureRoot("wb-tasks-test-");
 	allocatedTempDirs.push(canonical);
 	return canonical;
 }
@@ -155,7 +142,7 @@ async function createProjectRoot(): Promise<string> {
  */
 let isSymlinkPermitted = false;
 try {
-	const probeDir = await mkdtemp(path.join(os.tmpdir(), "wb-symlink-probe-"));
+	const probeDir = await createFixtureRoot("wb-symlink-probe-");
 	allocatedTempDirs.push(probeDir);
 	const targetPath = path.join(probeDir, "probe-target.txt");
 	const linkPath = path.join(probeDir, "probe-link.txt");
@@ -179,7 +166,7 @@ const symlinkTest = isSymlinkPermitted ? it : it.skip;
  */
 let isDirectoryLinkPermitted = false;
 try {
-	const probeDir = await mkdtemp(path.join(os.tmpdir(), "wb-dirlink-probe-"));
+	const probeDir = await createFixtureRoot("wb-dirlink-probe-");
 	allocatedTempDirs.push(probeDir);
 	const targetPath = path.join(probeDir, "probe-target-dir");
 	const linkPath = path.join(probeDir, "probe-link-dir");
@@ -276,6 +263,74 @@ describe("binding operations", () => {
 			"utf-8"
 		);
 		caughtError = null;
+		try {
+			await readBinding(projectRoot);
+		} catch (err: unknown) {
+			caughtError = err;
+		}
+		expect(caughtError instanceof WbTaskError).toBe(true);
+		if (caughtError instanceof WbTaskError) {
+			expect(caughtError.code).toBe(WB_ERROR_CODE.bindingInvalid);
+		}
+	});
+
+	it("round-trips the project-wide enrollment policy and the roster", async () => {
+		const projectRoot = await createProjectRoot();
+		const binding: Binding = {
+			version: 2,
+			projectRoot,
+			sessionId: crypto.randomUUID(),
+			workbuddyVersion: "5.8.2",
+			autoBindProjectSessions: true,
+			sessions: [
+				{ sessionId: crypto.randomUUID(), role: "default", workbuddyVersion: "5.8.2" },
+				{ sessionId: crypto.randomUUID(), title: "Second", workbuddyVersion: "9.9.9" },
+			],
+		};
+
+		await writeBinding(binding);
+
+		const retrieved = await readBinding(projectRoot);
+		expect(retrieved).toEqual(binding);
+	});
+
+	it("keeps the enrollment policy of a legacy single-session binding", async () => {
+		const projectRoot = await createProjectRoot();
+		const bridgeDir = path.join(projectRoot, ".wb-bridge");
+		await mkdir(bridgeDir, { recursive: true });
+		await writeFile(
+			path.join(bridgeDir, "binding.json"),
+			JSON.stringify({
+				version: 1,
+				projectRoot,
+				sessionId: crypto.randomUUID(),
+				workbuddyVersion: "5.8.2",
+				autoBindProjectSessions: true,
+			}),
+			"utf-8",
+		);
+
+		const retrieved = await readBinding(projectRoot);
+		expect(retrieved?.autoBindProjectSessions).toBe(true);
+	});
+
+	it("rejects a non-boolean enrollment policy", async () => {
+		const projectRoot = await createProjectRoot();
+		const bridgeDir = path.join(projectRoot, ".wb-bridge");
+		await mkdir(bridgeDir, { recursive: true });
+		await writeFile(
+			path.join(bridgeDir, "binding.json"),
+			JSON.stringify({
+				version: 1,
+				projectRoot,
+				sessionId: crypto.randomUUID(),
+				workbuddyVersion: "5.8.2",
+				autoBindProjectSessions: "yes",
+			}),
+			"utf-8",
+		);
+
+		let caughtError: unknown = null;
 		try {
 			await readBinding(projectRoot);
 		} catch (err: unknown) {

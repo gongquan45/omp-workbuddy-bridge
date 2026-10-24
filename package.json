@@ -1,11 +1,11 @@
 {
 	"name": "omp-wb-bridge",
-	"version": "2.0.0",
+	"version": "2.1.0",
 	"description": "OMP-native extension delegating research/office/design tasks to WorkBuddy desktop agent sessions",
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"test": "bun test",
+		"test": "bun test test",
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {

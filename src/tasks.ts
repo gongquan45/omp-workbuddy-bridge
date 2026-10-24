@@ -3,6 +3,7 @@ import {
 	copyFile,
 	lstat,
 	mkdir,
+	open,
 	readdir,
 	readFile,
 	realpath,
@@ -37,9 +38,13 @@ import type {
 	TaskLock,
 	TaskManifestPayload,
 	TaskReceipt,
+	TaskReceiptV3,
 	TaskRequest,
 	TaskRound,
+	TaskRoundV3,
 	TaskStatus,
+	TaskStatusV3,
+	TurnAttemptV3,
 } from "./types";
 import { taskError, WB_ERROR_CODE, WbTaskError } from "./types";
 export { WbTaskError };
@@ -94,12 +99,30 @@ function validateBindingShape(raw: unknown, source: string): Binding {
 	// malformed entry rejects the whole file rather than being filtered out,
 	// because silently accepting a scrubbed roster would let any writer widen
 	// the set of sessions this project may delegate to.
+	// The project-wide auto-enrollment consent is a policy flag, not a roster.
+	// It is accepted under either version marker: a v1 file written before the
+	// policy existed simply has no flag, and a v1 file that carries one still
+	// records a decision the user made, so dropping it would lose consent.
+	let autoBindProjectSessions: boolean | undefined;
+	if ("autoBindProjectSessions" in raw) {
+		if (typeof raw.autoBindProjectSessions !== "boolean") {
+			throw new WbTaskError(
+				WB_ERROR_CODE.bindingInvalid,
+				`Malformed binding file at ${source}: autoBindProjectSessions must be a boolean when present`
+			);
+		}
+		autoBindProjectSessions = raw.autoBindProjectSessions;
+	}
+
 	const result: Binding = {
 		version,
 		projectRoot: raw.projectRoot,
 		sessionId: raw.sessionId,
 		workbuddyVersion: raw.workbuddyVersion,
 	};
+	if (autoBindProjectSessions !== undefined) {
+		result.autoBindProjectSessions = autoBindProjectSessions;
+	}
 	if (version === 2) {
 		if (!("sessions" in raw) || !Array.isArray(raw.sessions)) {
 			throw new WbTaskError(
@@ -143,6 +166,18 @@ function validateBindingShape(raw: unknown, source: string): Binding {
 					`Malformed binding file at ${source}: roster entry isDefault must be a boolean when present`
 				);
 			}
+			if (candidate.workbuddyVersion !== undefined && typeof candidate.workbuddyVersion !== "string") {
+				throw new WbTaskError(
+					WB_ERROR_CODE.bindingInvalid,
+					`Malformed binding file at ${source}: roster entry workbuddyVersion must be a string when present`
+				);
+			}
+			if (candidate.verified !== undefined && typeof candidate.verified !== "boolean") {
+				throw new WbTaskError(
+					WB_ERROR_CODE.bindingInvalid,
+					`Malformed binding file at ${source}: roster entry verified must be a boolean when present`
+				);
+			}
 			const rosterEntry: BoundSession = { sessionId: candidate.sessionId };
 			if (candidate.role !== undefined) {
 				rosterEntry.role = candidate.role;
@@ -152,6 +187,12 @@ function validateBindingShape(raw: unknown, source: string): Binding {
 			}
 			if (candidate.isDefault !== undefined) {
 				rosterEntry.isDefault = candidate.isDefault;
+			}
+			if (candidate.workbuddyVersion !== undefined) {
+				rosterEntry.workbuddyVersion = candidate.workbuddyVersion;
+			}
+			if (candidate.verified !== undefined) {
+				rosterEntry.verified = candidate.verified;
 			}
 			sessions.push(rosterEntry);
 		}
@@ -210,20 +251,73 @@ function parseStatusField(rawStatus: unknown, source: string): TaskStatus {
 	}
 }
 
-export function currentRound(receipt: TaskReceipt): TaskRound {
+/**
+ * Validates a round status under the queue model.
+ *
+ * v2 knew only terminal and live-turn states; v3 adds `queued` and
+ * `awaiting_help`. Reusing the v2 parser for a v3 file would reject the state a
+ * freshly submitted task is legitimately in, so the two vocabularies are kept
+ * apart instead of being widened for one another.
+ */
+function parseStatusV3Field(rawStatus: unknown, source: string): TaskStatusV3 {
+	switch (rawStatus) {
+		case "queued":
+		case "running":
+		case "awaiting_approval":
+		case "awaiting_help":
+		case "completed":
+		case "failed":
+		case "cancelled":
+		case "interrupted":
+			return rawStatus;
+		default:
+			throw new WbTaskError(
+				WB_ERROR_CODE.taskStateInvalid,
+				`Malformed task receipt at ${source}: unknown round status "${String(rawStatus)}"`,
+			);
+	}
+}
+
+/**
+ * Returns the latest round of a receipt of either version.
+ *
+ * Both versions carry an ordered `rounds` array whose last element is the current
+ * one, so the caller does not need to know which schema produced the file.
+ */
+/**
+ * True when a task is still occupying its slot.
+ *
+ * `queued` and `awaiting_help` are in flight just as much as `running`: treating
+ * either as settled would let a supplemental round be appended to work that has
+ * not delivered yet, or let a cancellation skip a task that is about to run.
+ */
+export function statusIsInFlight(status: TaskStatus): boolean {
+	return status === "queued" || status === "running" || status === "awaiting_approval" || status === "awaiting_help";
+}
+
+export function currentRound<R extends { taskId: string; rounds: readonly TaskRound[] }>(
+	receipt: R,
+): R["rounds"][number] {
 	if (!receipt || !Array.isArray(receipt.rounds) || receipt.rounds.length === 0) {
 		throw new WbTaskError(
 			WB_ERROR_CODE.taskStateInvalid,
 			`Receipt for task ${receipt?.taskId ?? "unknown"} has no execution rounds`
 		);
 	}
-	for (let i = 0; i < receipt.rounds.length; i++) {
-		const round = receipt.rounds[i];
-		if (!round || round.number !== i + 1) {
-			throw new WbTaskError(
-				WB_ERROR_CODE.taskStateInvalid,
-				`Receipt for task ${receipt.taskId} has discontinuous round number at index ${i}: expected ${i + 1}, got ${round?.number}`
-			);
+	// A receipt either enumerates every round from the first one, or it is a single
+	// round's record (the v3 per-round receipt, and the v2 view derived from it). Only
+	// the first shape can be checked for gaps: a one-round receipt for round 3 is
+	// complete evidence of round 3, and demanding round 1 here would make a
+	// supplemental round unreadable by the very code that just wrote it.
+	if (receipt.rounds.length > 1 || receipt.rounds[0]!.number === 1) {
+		for (let i = 0; i < receipt.rounds.length; i++) {
+			const round = receipt.rounds[i];
+			if (!round || round.number !== i + 1) {
+				throw new WbTaskError(
+					WB_ERROR_CODE.taskStateInvalid,
+					`Receipt for task ${receipt.taskId} has discontinuous round number at index ${i}: expected ${i + 1}, got ${round?.number}`
+				);
+			}
 		}
 	}
 	return receipt.rounds[receipt.rounds.length - 1]!;
@@ -245,6 +339,8 @@ export interface RoundPaths {
 	inputsDir: string;
 	outputsDir: string;
 	briefPath: string;
+	/** Where this round's single, never-overwritten receipt belongs. */
+	receiptPath: string;
 }
 
 /**
@@ -272,6 +368,8 @@ export function resolveRoundPaths(projectRoot: string, taskId: string, round: nu
 			inputsDir: path.join(taskDir, "inputs"),
 			outputsDir: path.join(taskDir, "outputs"),
 			briefPath: path.join(taskDir, "brief.md"),
+			// Legacy rounds really do keep their receipt at the task root.
+			receiptPath: path.join(taskDir, "receipt.json"),
 		};
 	}
 	const roundDir = path.join(taskDir, "rounds", String(round));
@@ -280,6 +378,7 @@ export function resolveRoundPaths(projectRoot: string, taskId: string, round: nu
 		inputsDir: path.join(roundDir, "inputs"),
 		outputsDir: path.join(roundDir, "outputs"),
 		briefPath: path.join(roundDir, "brief.md"),
+		receiptPath: path.join(roundDir, "receipt.json"),
 	};
 }
 
@@ -479,7 +578,12 @@ function validateReceiptObject(raw: unknown, source: string): TaskReceipt {
 			if (typeof r !== "object" || r === null) {
 				throw new WbTaskError(WB_ERROR_CODE.taskStateInvalid, `Malformed task receipt at ${source}: round ${i + 1} must be an object`);
 			}
-			if (r.number !== i + 1) {
+			// A receipt either enumerates every round from the first, or it is the record of
+			// exactly one round (the v3 per-round file, which the v3 reader presents through
+			// this validator). Demanding round 1 from a single-round record makes every
+			// supplemental round unreadable by the reader that wrote it.
+			const singleRound = v2.rounds.length === 1;
+			if (singleRound ? typeof r.number !== "number" || r.number < 1 : r.number !== i + 1) {
 				throw new WbTaskError(
 					WB_ERROR_CODE.taskStateInvalid,
 					`Malformed task receipt at ${source}: round number at index ${i} must be ${i + 1}`
@@ -574,7 +678,10 @@ function validateReceiptObject(raw: unknown, source: string): TaskReceipt {
 			}
 
 			rounds.push({
-				number: i + 1,
+				// Single-round records carry their own round number: rewriting it to the
+				// array index would turn round 2 into round 1 on every read, and the next
+				// supplemental round would then collide with the round it just rewrote.
+				number: v2.rounds.length === 1 ? (r.number as number) : i + 1,
 				layout: r.layout,
 				goal: {
 					objective: g.objective,
@@ -606,6 +713,191 @@ function validateReceiptObject(raw: unknown, source: string): TaskReceipt {
 		WB_ERROR_CODE.taskStateInvalid,
 		`Malformed task receipt at ${source}: unsupported version ${String(raw.version)}`
 	);
+}
+
+/**
+ * Parses a v3 round receipt.
+ *
+ * v3 is additive on v2: a round keeps every v2 field and adds the authorization
+ * reference, commit fence and armed turns. This parser therefore reuses the v2
+ * validation for the shared part and then reads the v3-only fields, so a v2 file
+ * stays readable forever without a second, drifting implementation.
+ */
+export function parseRoundReceiptJson(content: string, source: string): TaskReceiptV3 {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(content);
+	} catch (err: unknown) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new WbTaskError(WB_ERROR_CODE.taskStateInvalid, `Malformed JSON in task receipt at ${source}: ${message}`);
+	}
+	return validateRoundReceiptObject(parsed, source);
+}
+
+/** Validates an already-parsed v3 body; the single v3 shape authority. */
+function validateRoundReceiptObject(parsed: unknown, source: string): TaskReceiptV3 {
+	if (typeof parsed !== "object" || parsed === null || !("version" in parsed) || parsed.version !== 3) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.taskStateInvalid,
+			`Malformed task receipt at ${source}: not a version 3 receipt`,
+		);
+	}
+	// Validate the shared shape by presenting it as v2 to the single validator. The
+	// status is the one field whose vocabulary differs, so it is validated here
+	// (and temporarily normalized) rather than being rejected by the v2 rules.
+	const parsedRecord = parsed as Record<string, unknown>;
+	const rawRoundsForStatus = parsedRecord.rounds;
+	if (!Array.isArray(rawRoundsForStatus)) {
+		throw new WbTaskError(WB_ERROR_CODE.taskStateInvalid, `Malformed task receipt at ${source}: rounds must be an array`);
+	}
+	const v3Statuses: TaskStatusV3[] = rawRoundsForStatus.map((raw, index) => {
+		if (typeof raw !== "object" || raw === null) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.taskStateInvalid,
+				`Malformed task receipt at ${source}: round ${index + 1} must be an object`,
+			);
+		}
+		return parseStatusV3Field("status" in raw ? raw.status : undefined, source);
+	});
+	const asV2: Record<string, unknown> = {
+		...parsed,
+		version: 2,
+		rounds: rawRoundsForStatus.map((raw) => {
+			// `queued`/`awaiting_help` become `running` only for the shared validator;
+			// the real value is restored from `v3Statuses` below.
+			const record = raw as Record<string, unknown>;
+			const normalized =
+				record.status === "queued" || record.status === "awaiting_help" ? "running" : record.status;
+			return { ...record, status: normalized };
+		}),
+	};
+	const base = validateReceiptObject(asV2, source);
+
+	const record = parsed as Record<string, unknown>;
+	const rawRounds = record.rounds;
+	if (!Array.isArray(rawRounds)) {
+		throw new WbTaskError(WB_ERROR_CODE.taskStateInvalid, `Malformed task receipt at ${source}: rounds must be an array`);
+	}
+	const rounds: TaskRoundV3[] = base.rounds.map((round, index) => {
+		const raw = rawRounds[index];
+		const rawRound: Record<string, unknown> = typeof raw === "object" && raw !== null ? { ...raw } : {};
+		// Decision-bearing fields are strict, never defaulted. An empty
+		// `snapshotRoot` would make later `path.join(snapshotRoot, …)` resolve
+		// against the process cwd — the repository — and a blank `requestId` would
+		// silently break every commit-token comparison. A record missing either is
+		// malformed, not merely incomplete.
+		if (rawRound.recordKind !== "approved" && rawRound.recordKind !== "legacy") {
+			throw new WbTaskError(
+				WB_ERROR_CODE.taskStateInvalid,
+				`Malformed task receipt at ${source}: round ${index + 1} must declare recordKind approved or legacy`,
+			);
+		}
+		if (typeof rawRound.requestId !== "string" || rawRound.requestId.trim().length === 0) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.taskStateInvalid,
+				`Malformed task receipt at ${source}: round ${index + 1} must declare requestId`,
+			);
+		}
+		if (typeof rawRound.snapshotRoot !== "string" || rawRound.snapshotRoot.trim().length === 0) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.taskStateInvalid,
+				`Malformed task receipt at ${source}: round ${index + 1} must declare snapshotRoot`,
+			);
+		}
+		if (
+			typeof rawRound.targetPolicy !== "object" ||
+			rawRound.targetPolicy === null ||
+			(("kind" in rawRound.targetPolicy ? rawRound.targetPolicy.kind : null) !== "session" &&
+				("kind" in rawRound.targetPolicy ? rawRound.targetPolicy.kind : null) !== "workspace_pool")
+		) {
+			throw new WbTaskError(
+				WB_ERROR_CODE.taskStateInvalid,
+				`Malformed task receipt at ${source}: round ${index + 1} must declare a targetPolicy`,
+			);
+		}
+		const recordKind = rawRound.recordKind;
+		const turns: TurnAttemptV3[] = Array.isArray(rawRound.turns)
+			? rawRound.turns.flatMap((turn: unknown) => {
+					if (typeof turn !== "object" || turn === null) {
+						return [];
+					}
+					const entry = turn as Record<string, unknown>;
+					if (
+						typeof entry.attemptId !== "string" ||
+						typeof entry.promptSha256 !== "string" ||
+						typeof entry.consentAt !== "string" ||
+						(entry.kind !== "primary" && entry.kind !== "help_resume")
+					) {
+						return [];
+					}
+					return [
+						{
+							attemptId: entry.attemptId,
+							kind: entry.kind,
+							promptSha256: entry.promptSha256,
+							consentAt: entry.consentAt,
+							stopReason: typeof entry.stopReason === "string" ? entry.stopReason : null,
+						} satisfies TurnAttemptV3,
+					];
+				})
+			: [];
+		const commitToken =
+			typeof rawRound.commitToken === "object" && rawRound.commitToken !== null
+				? (() => {
+						const token = rawRound.commitToken as Record<string, unknown>;
+						return typeof token.requestId === "string" && typeof token.resultRevision === "number"
+							? { requestId: token.requestId, resultRevision: token.resultRevision }
+							: null;
+					})()
+				: null;
+		return {
+			...round,
+			status: v3Statuses[index]!,
+			recordKind,
+			requestId: rawRound.requestId,
+			targetPolicy: rawRound.targetPolicy as TargetPolicy,
+			snapshotRoot: rawRound.snapshotRoot,
+			owner:
+				typeof rawRound.owner === "object" && rawRound.owner !== null
+					? (rawRound.owner as OwnerIdentity)
+					: null,
+			manifestSha256: typeof rawRound.manifestSha256 === "string" ? rawRound.manifestSha256 : null,
+			commitToken,
+			turns,
+			consent: round.consent,
+		};
+	});
+
+	return {
+		version: 3,
+		taskId: base.taskId,
+		sessionId: base.sessionId,
+		projectRoot: base.projectRoot,
+		rounds,
+	};
+}
+
+/**
+ * Reads a receipt of either supported version.
+ *
+ * The union is permanent: v2 files predate rounds and must stay readable, while
+ * everything the bridge writes from now on is v3. Callers discriminate on
+ * `version` instead of assuming one shape.
+ */
+export function parseAnyReceiptJson(content: string, source: string): TaskReceipt | TaskReceiptV3 {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(content);
+	} catch (err: unknown) {
+		const message = err instanceof Error ? err.message : String(err);
+		throw new WbTaskError(WB_ERROR_CODE.taskStateInvalid, `Malformed JSON in task receipt at ${source}: ${message}`);
+	}
+	// Dispatch on the *parsed* version, never on a textual match: a v2 receipt's
+	// goal text may legitimately contain the characters `"version": 3`.
+	if (typeof parsed === "object" && parsed !== null && "version" in parsed && parsed.version === 3) {
+		return validateRoundReceiptObject(parsed, source);
+	}
+	return validateReceiptObject(parsed, source);
 }
 
 /**
@@ -834,7 +1126,7 @@ async function acquireLock(projectRoot: string, taskId: string): Promise<void> {
 		}
 		if (orphan !== null) {
 			const current = currentRound(orphan);
-			if (current.status === "running" || current.status === "awaiting_approval") {
+			if (statusIsInFlight(current.status)) {
 				current.status = "interrupted";
 				current.error = taskError(
 					WB_ERROR_CODE.interrupted,
@@ -927,6 +1219,11 @@ export async function writeBinding(binding: Binding): Promise<void> {
 			projectRoot: root,
 			sessionId: binding.sessionId,
 			workbuddyVersion: binding.workbuddyVersion,
+			// The project-wide enrollment consent is part of the record, so a
+			// restart restores the policy instead of asking the user again.
+			...(binding.autoBindProjectSessions === undefined
+				? {}
+				: { autoBindProjectSessions: binding.autoBindProjectSessions }),
 			// A v1 file must not carry a roster: the validator rejects that shape
 			// as tampering, so writing it would make our own file unreadable.
 			...(binding.version === 2 ? { sessions: binding.sessions ?? [] } : {}),
@@ -963,25 +1260,12 @@ export async function readTask(projectRoot: string, taskId: string): Promise<Tas
 		);
 	}
 
-	const receiptPath = path.join(root, ".wb-bridge", "tasks", taskId, "receipt.json");
-	let content: string;
-	try {
-		content = await readFile(receiptPath, "utf-8");
-	} catch (err: unknown) {
-		if (typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT") {
-			throw new WbTaskError(
-				WB_ERROR_CODE.taskNotFound,
-				`Task receipt not found for task ${taskId}`
-			);
-		}
-		const msg = err instanceof Error ? err.message : String(err);
-		throw new WbTaskError(
-			WB_ERROR_CODE.taskStateInvalid,
-			`Failed to read receipt file at ${receiptPath}: ${msg}`
-		);
-	}
-
-	return parseReceiptJson(content, receiptPath);
+	// Locate the receipt through the same resolver the writer uses. A v3 task keeps
+	// one file per round; a v2 task keeps one at the task root. Hand-building the
+	// path here is how a reader ends up reporting "not found" for a task the writer
+	// just committed.
+	const { receiptPath, content } = await readNewestRoundReceipt(root, taskId);
+	return toTaskReceiptView(parseAnyReceiptJson(content, receiptPath));
 }
 
 /**
@@ -1097,7 +1381,11 @@ export async function readTaskIndex(
 				continue;
 			}
 
-			const receiptPath = path.join(taskDir, "receipt.json");
+			// The same resolver the writer uses decides which file is authoritative:
+			// a v3 task's newest round receipt, else the v2 task-root receipt. A
+			// hand-built root path here would list a dispatched task as a warning.
+			const located = await locateTaskReceipt(root, name, taskDir);
+			const receiptPath = located.receiptPath;
 			const receiptStat = await lstat(receiptPath);
 			if (!receiptStat.isFile() || receiptStat.isSymbolicLink()) {
 				warnings.push({
@@ -1116,7 +1404,7 @@ export async function readTaskIndex(
 				continue;
 			}
 
-			const receipt = parseReceiptJson(await readFile(receiptPath, "utf-8"), receiptPath);
+			const receipt = parseAnyReceiptJson(await readFile(receiptPath, "utf-8"), receiptPath);
 
 			// The record has to belong to this project and to this directory, or it
 			// would be reported under an identity it does not actually have.
@@ -1144,7 +1432,9 @@ export async function readTaskIndex(
 			const current = currentRound(receipt);
 			entries.push({
 				taskId: receipt.taskId,
-				sessionId: receipt.sessionId,
+				// A v3 receipt may record no OMP session (native or imported work);
+				// the index reports that as an empty string rather than inventing one.
+				sessionId: receipt.sessionId ?? "",
 				round: current.number,
 				status: current.status,
 				updatedAt: receiptStat.mtimeMs,
@@ -1197,6 +1487,229 @@ export async function writeTask(receipt: TaskReceipt): Promise<void> {
 		await atomicWriteFile(taskDir, receiptPath, content);
 	} catch (err: unknown) {
 		throw storageFailure(receipt.taskId, "receipt write", err);
+	}
+}
+
+/** Result of durably writing one round receipt. */
+export interface WrittenReceipt {
+	receiptPath: string;
+	/** SHA-256 of the bytes actually on disk, read back after the rename. */
+	sha256: string;
+	bytes: number;
+}
+
+/**
+ * Writes one round's receipt as a self-verifying file.
+ *
+ * The order is what makes a crash recoverable: write the bytes to a temporary
+ * file in the same directory, flush it, rename it into place, then read it back
+ * and compare digests. A caller that gets a `WrittenReceipt` may confirm the
+ * commit in the queue; a caller that gets a throw must not, because the file is
+ * not provably there.
+ *
+ * The receipt never contains its own digest — a file cannot hash itself — so the
+ * returned digest is what the database records as evidence.
+ *
+ * An existing receipt is never overwritten: each attempt has exactly one logical
+ * commit, and a second write would rewrite history instead of preserving it.
+ */
+export async function writeRoundReceipt(
+	projectRoot: string,
+	taskId: string,
+	round: number,
+	layout: "legacy" | "round",
+	receipt: unknown,
+): Promise<WrittenReceipt> {
+	const canonicalRoot = await realpath(projectRoot).catch(() => projectRoot);
+	const paths = resolveRoundPaths(canonicalRoot, taskId, round, layout);
+	const content = `${JSON.stringify(receipt, null, 2)}\n`;
+	const digest = crypto.createHash("sha256").update(content, "utf-8").digest("hex");
+
+	const tempPath = path.join(paths.roundDir, `.receipt-${crypto.randomUUID()}.tmp`);
+	try {
+		await mkdir(paths.roundDir, { recursive: true });
+		const handle = await open(tempPath, "w");
+		try {
+			await handle.writeFile(content, "utf-8");
+			// Flush the bytes before the rename: a rename that lands while the data is
+			// still in the page cache leaves a correctly-named empty file after a power
+			// loss, which would look like a successful commit.
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		await rename(tempPath, paths.receiptPath);
+	} catch (err: unknown) {
+		await unlink(tempPath).catch(() => undefined);
+		throw storageFailure(taskId, "receipt write", err);
+	}
+
+	// Directory flush is not portable on Windows; the platform guarantee is the
+	// file flush above plus the read-back below, which is stated rather than assumed.
+	let onDisk: string;
+	try {
+		onDisk = await readFile(paths.receiptPath, "utf-8");
+	} catch (err: unknown) {
+		throw storageFailure(taskId, "receipt read-back", err);
+	}
+	const onDiskDigest = crypto.createHash("sha256").update(onDisk, "utf-8").digest("hex");
+	if (onDiskDigest !== digest) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.storageError,
+			`Receipt for task ${taskId} round ${round} did not survive the write: on-disk digest ${onDiskDigest} is not ${digest}`,
+		);
+	}
+	return { receiptPath: paths.receiptPath, sha256: onDiskDigest, bytes: Buffer.byteLength(onDisk, "utf-8") };
+}
+
+
+/**
+ * Presents either receipt version through the v2 view.
+ *
+ * Callers that predate rounds keep working unchanged, and the v3-only evidence
+ * (commit fence, armed turns, authorization reference) stays reachable through
+ * {@link readAnyTask} rather than being flattened away globally.
+ */
+export function toTaskReceiptView(receipt: TaskReceipt | TaskReceiptV3): TaskReceipt {
+	if (receipt.version === 2) {
+		return receipt;
+	}
+	return {
+		version: 2,
+		taskId: receipt.taskId,
+		// The v2 view requires a session id; v3 allows null for work no OMP session
+		// owns (native or imported), which this view reports as unattributed.
+		sessionId: receipt.sessionId ?? "",
+		projectRoot: receipt.projectRoot,
+		rounds: receipt.rounds.map((round) => ({
+			number: round.number,
+			layout: round.layout,
+			goal: round.goal,
+			inputFiles: round.inputFiles,
+			expectedOutputs: round.expectedOutputs,
+			status: round.status,
+			summary: round.summary,
+			error: round.error,
+			artifacts: round.artifacts,
+			consent: round.consent,
+		})),
+	};
+}
+
+export async function readCurrentRoundReceipt(projectRoot: string, taskId: string): Promise<TaskReceipt> {
+	const canonicalRoot = await realpath(projectRoot).catch(() => projectRoot);
+	if (!UUID_PATTERN.test(taskId)) {
+		throw new WbTaskError(WB_ERROR_CODE.taskNotFound, `Task ID "${taskId}" is not a valid UUID`);
+	}
+	const taskDir = path.join(canonicalRoot, ".wb-bridge", "tasks", taskId);
+	let roundDirectories: string[];
+	try {
+		roundDirectories = await readdir(path.join(taskDir, "rounds"));
+	} catch {
+		roundDirectories = [];
+	}
+	const { receiptPath, content } = await readNewestRoundReceipt(canonicalRoot, taskId);
+	return toTaskReceiptView(parseAnyReceiptJson(content, receiptPath));
+}
+
+/** True when an error is a plain "the file is not there". */
+function isMissingFile(err: unknown): boolean {
+	return (
+		typeof err === "object" &&
+		err !== null &&
+		"code" in err &&
+		typeof err.code === "string" &&
+		err.code === "ENOENT"
+	);
+}
+
+/**
+ * Chooses the receipt file that represents a task in the history index.
+ *
+ * Prefers the newest round receipt, then older rounds, then the v2 root receipt.
+ * Only existence is checked here: the caller applies the real-file and
+ * containment checks to whichever path wins, so a substituted link is still
+ * refused at the same gate as before.
+ */
+async function locateTaskReceipt(
+	root: string,
+	taskId: string,
+	taskDir: string,
+): Promise<{ receiptPath: string }> {
+	let roundNames: string[];
+	try {
+		roundNames = await readdir(path.join(taskDir, "rounds"));
+	} catch {
+		roundNames = [];
+	}
+	const rounds = roundNames
+		.map((value) => Number.parseInt(value, 10))
+		.filter((round) => Number.isInteger(round) && round > 0)
+		.sort((left, right) => right - left);
+	for (const round of rounds) {
+		const candidate = resolveRoundPaths(root, taskId, round, "round").receiptPath;
+		try {
+			await lstat(candidate);
+			return { receiptPath: candidate };
+		} catch (err: unknown) {
+			if (isMissingFile(err)) {
+				continue;
+			}
+			throw err;
+		}
+	}
+	return { receiptPath: resolveRoundPaths(root, taskId, 1, "legacy").receiptPath };
+}
+
+/**
+ * Finds and reads the receipt that governs a task, without parsing it.
+ *
+ * Returns the newest round receipt when round directories exist, otherwise the
+ * legacy task-root receipt. Callers that only need the bytes (single reads, the
+ * history index) share this so they agree about which file is authoritative.
+ */
+async function readNewestRoundReceipt(
+	root: string,
+	taskId: string,
+): Promise<{ receiptPath: string; content: string }> {
+	const taskDir = path.join(root, ".wb-bridge", "tasks", taskId);
+	let roundNames: string[];
+	try {
+		roundNames = await readdir(path.join(taskDir, "rounds"));
+	} catch {
+		roundNames = [];
+	}
+	const rounds = roundNames
+		.map((name) => Number.parseInt(name, 10))
+		.filter((round) => Number.isInteger(round) && round > 0)
+		.sort((left, right) => right - left);
+	for (const round of rounds) {
+		const candidate = resolveRoundPaths(root, taskId, round, "round").receiptPath;
+		try {
+			return { receiptPath: candidate, content: await readFile(candidate, "utf-8") };
+		} catch (err: unknown) {
+			if (isMissingFile(err)) {
+				continue;
+			}
+			const message = err instanceof Error ? err.message : String(err);
+			throw new WbTaskError(
+				WB_ERROR_CODE.taskStateInvalid,
+				`Failed to read receipt file at ${candidate}: ${message}`,
+			);
+		}
+	}
+	const legacy = resolveRoundPaths(root, taskId, 1, "legacy").receiptPath;
+	try {
+		return { receiptPath: legacy, content: await readFile(legacy, "utf-8") };
+	} catch (err: unknown) {
+		if (isMissingFile(err)) {
+			throw new WbTaskError(WB_ERROR_CODE.taskNotFound, `Task receipt not found for task ${taskId}`);
+		}
+		const message = err instanceof Error ? err.message : String(err);
+		throw new WbTaskError(
+			WB_ERROR_CODE.taskStateInvalid,
+			`Failed to read receipt file at ${legacy}: ${message}`,
+		);
 	}
 }
 
@@ -1284,7 +1797,7 @@ export async function prepareTask(
 		existingReceipt = await readTask(root, taskId);
 		const current = currentRound(existingReceipt);
 
-		if (current.status === "running" || current.status === "awaiting_approval") {
+		if (statusIsInFlight(current.status)) {
 			throw new WbTaskError(
 				WB_ERROR_CODE.busy,
 				`Task ${taskId} is currently ${current.status}; supplementary work requires a terminal state`
@@ -1447,7 +1960,7 @@ export async function prepareTask(
 		if (isSupplementary && existingReceipt !== null) {
 			const latestReceipt = await readTask(root, taskId);
 			const latestCurrent = currentRound(latestReceipt);
-			if (latestCurrent.status === "running" || latestCurrent.status === "awaiting_approval") {
+			if (statusIsInFlight(latestCurrent.status)) {
 				throw new WbTaskError(
 					WB_ERROR_CODE.busy,
 					`Task ${taskId} transitioned to ${latestCurrent.status} concurrently`
@@ -1865,11 +2378,106 @@ export function buildTaskManifestPayload(input: {
 }
 
 /**
+ * Builds the digest a dialog shows and staging later verifies.
+ *
+ * Exists so the confirmation and `stageTask` derive the digest from one
+ * implementation. A second copy of this construction is what makes a dialog
+ * approve bytes the staging step then rejects — the failure looks like a race
+ * ("inputs changed between confirmation and staging") when it is really two
+ * slightly different definitions of the same payload.
+ *
+ * `snapshotPath` is derived here exactly as staging derives it, because it is part
+ * of the hashed payload even though the physical stage directory is created later.
+ */
+export function buildConfirmationDigest(input: {
+	projectRoot: string;
+	requestId: string;
+	taskId: string;
+	round: number;
+	owner: OwnerIdentity;
+	goal: TaskGoal;
+	targetPolicy: TargetPolicy;
+	expectedOutputs: string[];
+	inputs: Array<{ path: string; sha256: string; bytes: number }>;
+	deliveryMode: DeliveryMode;
+}): string {
+	const outputsDir = resolveRoundPaths(input.projectRoot, input.taskId, input.round, "round").outputsDir;
+	const expectedOutputs = validatedOutputPaths(input.expectedOutputs, outputsDir);
+	const manifestInputs: ManifestInput[] = input.inputs.map((entry) => ({
+		path: canonicalRelPath(entry.path),
+		snapshotPath: `inputs/${canonicalRelPath(entry.path)}`,
+		bytes: entry.bytes,
+		sha256: entry.sha256,
+	}));
+	return hashManifestPayload(
+		buildTaskManifestPayload({
+			projectRoot: input.projectRoot,
+			requestId: input.requestId,
+			taskId: input.taskId,
+			round: input.round,
+			owner: input.owner,
+			goal: input.goal,
+			targetPolicy: input.targetPolicy,
+			expectedOutputs,
+			inputs: manifestInputs,
+			deliveryMode: input.deliveryMode,
+		}),
+	);
+}
+
+/**
  * Computes the canonical SHA-256 digest of a task manifest payload.
  *
  * Only the payload is hashed; the approval block and the digest itself are
  * excluded so nothing self-references.
  */
+/**
+ * Reads a staged manifest back and re-verifies it.
+ *
+ * A queued round is resumed from disk rather than from process memory, because the
+ * dispatch that created it may have ended. The digest is recomputed over the payload
+ * so a resumed send carries the same authorization the human approved; a manifest
+ * whose bytes no longer hash to its recorded digest is refused, never re-sent.
+ */
+export async function readStagedManifest(snapshotRoot: string): Promise<StagedTask> {
+	const manifestPath = path.join(snapshotRoot, "manifest.json");
+	let raw: string;
+	try {
+		raw = await readFile(manifestPath, "utf-8");
+	} catch (err: unknown) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.taskStateInvalid,
+			`Staged manifest at ${manifestPath} could not be read: ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (err: unknown) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.taskStateInvalid,
+			`Staged manifest at ${manifestPath} is not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
+		);
+	}
+	const record = parsed as { payload?: TaskManifestPayload; approval?: ManifestApproval };
+	const payload = record.payload;
+	const approval = record.approval;
+	if (payload === undefined || approval === undefined) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.taskStateInvalid,
+			`Staged manifest at ${manifestPath} is missing its payload or approval`,
+		);
+	}
+	const recomputed = hashManifestPayload(payload);
+	if (recomputed !== approval.payloadSha256) {
+		throw new WbTaskError(
+			WB_ERROR_CODE.taskStateInvalid,
+			`Staged manifest at ${manifestPath} does not match its recorded digest`,
+		);
+	}
+	return { snapshotRoot, manifestPath, manifestSha256: recomputed, manifest: { payload, approval } };
+}
+
 export function hashManifestPayload(payload: TaskManifestPayload): string {
 	return crypto.createHash("sha256").update(canonicalJson(payload), "utf-8").digest("hex");
 }
