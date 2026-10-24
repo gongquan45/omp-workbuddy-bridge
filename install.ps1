@@ -11,11 +11,11 @@
     would be a surprising and hard-to-undo change. When one is missing the script
     stops and names the official place to get it.
 
-    Nothing is written until the installer prints its plan. Pass -ApplyConfig to
-    let it write the WorkBuddy MCP entry; without that flag it only previews.
+    The default is a read-only preview. Review that plan before passing
+    -ApplyConfig to apply the release, plugin registration and WorkBuddy MCP entry.
 
 .PARAMETER ApplyConfig
-    Write the configuration entries the preview lists. Without it the installer
+    Apply the planned installation and configuration. Without it the installer
     stops after showing what it would do.
 
 .PARAMETER DryRun
@@ -88,13 +88,13 @@ if ($null -eq $workbuddy) {
 
 if ($DryRun) {
     Write-Step "Dry run: preflight passed, nothing was installed"
-    Write-Host "    Remove -DryRun to install."
+    Write-Host "    Remove -DryRun to preview the plan; use -ApplyConfig to apply it after review."
     exit 0
 }
 
 Write-Step "Running the installer"
 $arguments = @($entry)
-if ($ApplyConfig) { $arguments += '--apply-config' }
+if ($ApplyConfig) { $arguments += '--apply' } else { $arguments += '--preview' }
 
 # Run through the resolved Bun so the same runtime the installer verifies is the
 # one that executes it.
@@ -107,4 +107,8 @@ if ($exitCode -ne 0) {
 }
 
 Write-Host ""
-Write-Host "Done. Restart OMP to load the extension, then run /wb setup in your project." -ForegroundColor Green
+if ($ApplyConfig) {
+    Write-Host "Installation applied. Restart OMP and verify the loaded extension, then run /wb setup in your project." -ForegroundColor Green
+} else {
+    Write-Host "Preview only. Nothing was installed. Review the plan, then re-run with -ApplyConfig to apply it." -ForegroundColor Cyan
+}

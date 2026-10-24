@@ -14,9 +14,3 @@ node_modules/
 /_recovered/
 /memorix-report-backup.md
 /omp-wb-bridge-requirements-backup.md
-
-# Keep local evidence and internal working records out of source-only publication
-/docs/
-/smoke-workspace/
-/AGENTS.md
-/CHANGELOG.md
